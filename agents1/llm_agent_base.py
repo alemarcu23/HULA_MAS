@@ -44,7 +44,7 @@ logger = logging.getLogger('LLMAgentBase')
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-MAX_NR_TOKENS: int = 3000
+MAX_NR_TOKENS: int = 5000
 TEMPERATURE: float = 0.3
 
 # SharedMemory key templates
