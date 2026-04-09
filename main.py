@@ -26,7 +26,7 @@ if __name__ == "__main__":
     # ---- Deployment mode ----
     # False = local development (Ollama + GUI)
     # True  = HPC / headless (in-process transformers, no server needed)
-    hpc_mode = False
+    hpc_mode = True
 
     enable_gui = not hpc_mode
     llm_backend = 'transformers' if hpc_mode else 'ollama_sdk'
