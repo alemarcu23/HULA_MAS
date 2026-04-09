@@ -207,8 +207,10 @@ class SearchRescueAgent(LLMAgentBase):
             n_victims_near = len(self.WORLD_STATE.get('victims', []))
             n_obstacles_near = len(self.WORLD_STATE.get('obstacles', []))
             summaries = self.area_tracker.get_all_summaries()
-            explored_total = sum(s['explored_cells'] for s in summaries)
-            cell_total = sum(s['total_cells'] for s in summaries)
+            avg_coverage = (
+                sum(s['coverage'] for s in summaries) / len(summaries)
+                if summaries else 0.0
+            )
             n_global_victims = len(self.WORLD_STATE_GLOBAL.get('victims', []))
             n_global_obstacles = len(self.WORLD_STATE_GLOBAL.get('obstacles', []))
             print(
@@ -216,7 +218,7 @@ class SearchRescueAgent(LLMAgentBase):
                 f'loc={agent_loc} vision={vision} '
                 f'nearby(victims={n_victims_near} obstacles={n_obstacles_near}) '
                 f'global(victims={n_global_victims} obstacles={n_global_obstacles}) '
-                f'area_explored={explored_total}/{cell_total}'
+                f'area_coverage={avg_coverage:.0%}'
             )
 
     def decide_on_actions(self, filtered_state: State) -> Tuple[Optional[str], Dict]:
@@ -399,7 +401,7 @@ class SearchRescueAgent(LLMAgentBase):
             teammate_msgs = f'Messages you sent recently:\n{sent_lines}\n\nMessages from teammates:\n{teammate_msgs}'
 
         area_status = '\n'.join(
-            f"- {s['name']}: {s['explored_cells']}/{s['total_cells']} cells explored"
+            f"- {s['name']}: {s['coverage']:.0%} explored ({s['status']})"
             for s in area_summaries
         )
 
