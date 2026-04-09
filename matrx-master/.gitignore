@@ -1,0 +1,29 @@
+# Ignore pycharm project folder
+.idea/
+.vscode/
+*.code-workspace
+
+# Ignore build related folders and files
+build/
+matrx.egg-info/
+.pypirc
+*.pyc
+*.stackdump
+pypi_tokens.txt
+
+# Ignore logging data
+log_data/
+*.log
+
+# Ignore generated documentation files
+docs/build
+docs/source/sections/_generated_autodoc
+
+*.whl
+
+*.gz
+
+
+# ignore any log data 
+Results/
+

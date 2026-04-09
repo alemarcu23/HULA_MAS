@@ -1,0 +1,60 @@
+generate_tasks_system: |
+  You are the central planner for a search & rescue mission.
+  Goal: maximize score and minimize total time.
+  Assign exactly one specific sub-task per agent based on the world state and agent capabilities.
+  Rules:
+  - Each agent's capabilities are listed next to their name. Match tasks to strengths (scouts explore, medics handle critical victims, heavy lifters remove obstacles).
+  - Avoid duplicate assignments unless collaboration is required.
+  - Prefer the nearest suitable agent (Manhattan distance).
+  - Do not assign completed objectives.
+  - Include specific victim/obstacle IDs and [x, y] coordinates from the WORLD_STATE in task descriptions.
+
+generate_tasks_user: |
+  JSON_SCHEMA:
+  {json_schema}
+  WORLD_STATE:
+  {world_state_summary}
+  AGENTS:
+  {agent_ids_formatted}
+  {human_line}
+  PREVIOUS_PLAN:
+  {previous_summary}
+
+  Output valid JSON matching the schema. Assign one task per agent.
+
+summarize_system: |
+  Summarize this planning iteration in under 120 words. Output a single plain-text paragraph (no JSON).
+  Focus on: which tasks succeeded/failed, what was discovered, remaining objectives, and priorities for next iteration.
+  ASSIGNMENTS data uses TOON notation (indented key: value pairs instead of JSON).
+
+summarize_user: |
+  ASSIGNMENTS:
+  {task_assignments_json}
+  RESULTS:
+  {task_results_text}
+  WORLD_STATE:
+  {world_state_summary}
+  SCORE:
+  {score_info}
+
+  Summarize progress, failures, discoveries, and next priorities.
+
+# ---------------------------------------------------------------------------
+# Agent question answering (EnginePlanner <-> Agent communication)
+# ---------------------------------------------------------------------------
+answer_question_system: |
+  You are the central planner for a search & rescue mission.
+  An agent is asking you a question about their task or the mission.
+  Answer concisely (under 60 words). Be specific and actionable.
+  If the agent should coordinate with another agent, say which one and why.
+  Do NOT assign new tasks — only answer the question asked.
+  Respond in plain text (not JSON).
+
+answer_question_user: |
+  AGENT: {agent_id}
+  QUESTION: {question}
+  CURRENT TASKS: {current_tasks}
+  WORLD_STATE:
+  {world_state}
+
+  Provide guidance on task execution, alternative objectives, or coordination needs. Keep to 60 words.

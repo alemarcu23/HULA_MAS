@@ -1,0 +1,152 @@
+# Few-shot examples for LLM prompts.
+
+# ── Per-tick action decision (ReasoningModule / reason_system) ─────────────────
+reasoning:
+  - user: |
+      TASK: Navigate to room entrance at [5, 3]
+      WORLD_STATE: {"victims":[],"obstacles":[{"id":"stone_1","type":"stone","location":[4,3]}],"doors":[{"area":"area_1","location":[5,3]}],"teammate_positions":{}}
+      POS: [3, 3]  CARRYING: nothing
+      NEARBY: {"stone:stone_1":["(4, 3)"]}
+      LAST_ACTIONS: 1. MoveTo([4, 3])
+    assistant: |
+      {"action": "RemoveObject", "params": {"object_id": "stone_1"}}
+
+  - user: |
+      TASK: Remove obstacle at [9, 2]
+      WORLD_STATE: {"victims":[],"obstacles":[{"id":"rock_1","type":"big_rock","location":[9,2]}],"doors":[{"area":"area_2","location":[9,4]}],"teammate_positions":{"rescuebot1":[20,11]}}
+      POS: [8, 6]  CARRYING: nothing
+      NEARBY: {}
+      LAST_ACTIONS: 1. MoveTo([8, 6])
+    assistant: |
+      {"action": "MoveTo", "params": {"x": 9, "y": 2}}
+
+  - user: |
+      TASK: Rescue critical victim victim_3 at [8, 6]
+      WORLD_STATE: {"victims":[{"id":"victim_3","type":"critical","location":[8,6]}],"obstacles":[],"doors":[{"area":"area_6","location":[9,7]}],"teammate_positions":{"humanagent":[8,7]}}
+      POS: [8, 6]  CARRYING: nothing
+      NEARBY: {"critical_victim:victim_3":["(8, 6)"],"human":[8,7]}
+      LAST_ACTIONS: 1. MoveTo([8, 6])
+      ACTION FEEDBACK: none
+    assistant: |
+      {"action": "CarryObjectTogether", "params": {"object_id": "victim_3"}}
+
+  - user: |
+      TASK: Remove stone_3 blocking path to area_2
+      POS: [5, 4]  CARRYING: nothing
+      NEARBY: {"stone:stone_3":["(6, 4)"]}
+      LAST_ACTIONS: 1. RemoveObject({'object_id': 'stone_3'}), stone_3 [FAILED: RemoveObject failed: stone_3 still present]
+      ACTION FEEDBACK: RemoveObject failed: stone_3 still present
+    assistant: |
+      {"action": "MoveTo", "params": {"x": 6, "y": 4}, "completing_subtask": "Move adjacent to stone_3 before removing"}
+
+
+# ── Task planning (EnginePlanner / generate_tasks_system) ─────────────────────
+generate_tasks:
+  - user: |
+      door_houses[4]{id,door}:
+      area_1,"[3, 4]"
+      area_2,"[9, 4]"
+      area_3,"[15, 4]"
+      area_4,"[21, 4]"
+      known_obstacles[1]{id,type,location}:
+        rock_1,big_rock,"[3, 4]"
+      teammate_positions:
+      rescuebot1[2]: 21,11
+      rescuebot0[2]: 22,11
+      AGENTS:
+      - rescuebot0 (vision: 3, strength: low, medical: low, speed: fast)
+      - rescuebot1 (vision: 1, strength: high, medical: low, speed: normal)
+      PREVIOUS_PLAN: None
+
+      Assign one task per agent.
+    assistant: |
+      {"tasks": {"rescuebot0": "Explore Area 2 starting from entrance at [9, 4] and search for victims", "rescuebot1": "Remove rock_1 (big_rock) blocking Area 1 entrance at [3, 4] using RemoveObject"}}
+
+# ── Iteration summarization (EnginePlanner / summarize_system) ────────────────
+summarize:
+  - user: |
+      ASSIGNMENTS:
+      tasks:
+        rescuebot0: "Explore Area 1 and search for victims"
+        rescuebot1: "Explore Area 2 and search for victims"
+      RESULTS:
+      rescuebot0: Explore Area 1 -> completed (found mildly_injured_woman at [3, 3])
+      rescuebot1: Explore Area 2 -> ticks_exhausted (partially explored, found stone blocking door)
+      WORLD_STATE:
+      victims[1]{id,type,location}: mildly_injured_woman,mild,"[3, 3]"
+      obstacles[1]{id,type,location}: stone_2,stone,"[9, 4]"
+      SCORE:
+      Victims rescued: 0/8, Score: 0, Block hit rate: 0.0
+    assistant: |
+      rescuebot0 fully explored Area 1, discovering 1 mild victim. rescuebot1 found a stone blocking Area 2 entrance and couldn't complete exploration. Score: 0/8 rescued. Next: rescue the found victim and clear the Area 2 obstruction.
+
+# ── Plan decomposition (PlanningModule / planning_decompose_system) ───────────
+planning_decompose:
+  - user: |
+      TASK: Rescue victim in area 1.
+      KNOWN WORLD STATE: victims[0]:
+      obstacles[0]:
+      doors[14]{id,door}:
+        area_1,"[3, 4]"
+        area_2,"[9, 4]"
+        area_3,"[15, 4]"
+        area_4,"[21, 4]"
+        area_5,"[3, 7]"
+        area_6,"[9, 7]"
+        area_7,"[15, 7]"
+        area_8,"[3, 16]"
+        area_9,"[9, 16]"
+        area_10,"[15, 16]"
+        area_11,"[3, 19]"
+        area_12,"[9, 19]"
+        area_13,"[15, 19]"
+        area_14,"[21, 19]"
+      help_requests[0]:
+      teammate_positions:
+        rescuebot0[2]: 22,11
+      MEMORY: None
+
+    assistant: |
+      Subtask1: Go to the door of Area 1 at [3, 4], as found in the world state-doors.
+      Subtask2: Remove any obstacle blocking the door if present (not mentioned in world state, so may or may not be there).
+      Subtask3: Search Area 1 for victims.
+      Subtask4: Move next to the victim and carry it
+      Subtask5: Navigate to the drop zone
+      Subtask6: Drop the victim at the drop zone
+
+
+# ── Plan evaluation (PlanningModule / planning_evaluate_system) ───────────────
+planning_evaluate:
+  []
+  # Example — uncomment and edit:
+  # - user: |
+  #     ORIGINAL TASK: Rescue mild victim victim_2 at [10, 4]
+  #     EXECUTED SUBTASKS: [MoveTo [10,4], CarryObject victim_2, NavigateToDropZone, Drop victim_2]
+  #     CURRENT WORLD STATE: {"known_victims": [{"id":"victim_2","type":"mild","location":[23,8],"rescued":true}]}
+  #     MEMORY: victim_2 delivered tick 55
+  #   assistant: |
+  #     {"success": true, "reason": "victim_2 was carried and dropped at drop zone (23,8)"}
+
+
+# ── Planner answering agent questions (EnginePlanner / answer_question_*) ─────
+planner_answer:
+  - user: |
+      AGENT: rescuebot0
+      QUESTION: I found a big rock blocking the entrance to area 3. Should I wait for help or explore elsewhere?
+      CURRENT TASKS: {"rescuebot0": "Explore Area 3", "rescuebot1": "Rescue victim_1 in Area 1"}
+      WORLD_STATE:
+      known_obstacles[1]{id,type,location}:
+        rock_1,big_rock,"[15, 4]"
+      teammate_positions:
+        rescuebot1[2]: 3,3
+    assistant: |
+      The rock at Area 3 needs cooperative removal. rescuebot1 is busy rescuing in Area 1 — skip Area 3 for now and explore Area 4 at [21, 4] instead. We will coordinate rock removal next iteration.
+
+# ── Memory extraction (RescueAgent / memory_extract_*) ───────────────────────
+memory_extract:
+  - user: |
+      ACTION: CarryObject victim_2
+      RESULT: success — now carrying victim_2
+      OBSERVATION: {"agent": {"location": [10, 4], "carrying": ["victim_2"]}}
+    assistant: |
+      {"entries": [{"type": "victim_found", "victim_id": "victim_2", "location": [10, 4], "severity": "mild", "tick": 55}]}

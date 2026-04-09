@@ -1,0 +1,95 @@
+# manual_plans.yaml — Manual task and plan overrides for the rescue simulation.
+#
+# Set `manual_plans_file = "manual_plans.yaml"` in main.py to activate.
+# Set `manual_plans_file = None` to revert to LLM-generated tasks and plans.
+#
+# SECTIONS (both are optional and independent):
+#
+#   iterations:   Replaces EnginePlanner LLM task generation.
+#                 One entry per planning iteration. If you run more iterations
+#                 than entries here, the last entry is reused.
+#                 Each entry maps agent_id → {task, plan (optional)}.
+#                 If 'plan' is omitted, PlanningModule uses LLM as normal.
+#
+#   agent_plans:  Replaces PlanningModule LLM plan decomposition only.
+#                 EnginePlanner still uses LLM to generate tasks.
+#                 Maps agent_id → plan text (numbered list of sub-tasks).
+#                 Used as a fallback when iterations lacks a plan for an agent.
+#
+# AGENT IDS: rescuebot_0, rescuebot_1, ... (matching num_rescue_agents in main.py)
+# DOOR LOCATIONS (from WorldBuilder):
+#   area_1:[3,4]  area_2:[9,4]   area_3:[15,4]  area_4:[21,4]
+#   area_5:[3,7]  area_6:[9,7]   area_7:[15,7]
+#   area_8:[3,16] area_9:[9,16]  area_10:[15,16]
+#   area_11:[3,19] area_12:[9,19] area_13:[15,19] area_14:[21,19]
+# DROP ZONE: [23, 8]
+
+iterations:
+  # --- Iteration 1 ---
+  - rescuebot0:
+      task: "Find what the other agent does not know"
+      plan: |
+        1. Go to Area 1.
+        2. Enter Area 1.
+
+    rescuebot1:
+      task: "Find what the other agent does not know"
+      plan: |
+        1. Go to Area 2.
+        2. Enter Area 2.
+
+
+  - rescuebot0:
+    task: "Explore area 1 and rescue any victims found"
+    plan: |
+      1. Move to area_1 door at [3, 4]
+      2. MoveNorth
+      3. Carry victim if it is in the nearby cells
+      4. Navigate to Drop Zone
+      5. Drop the victim at the drop zone
+
+    rescuebot1:
+      task: "Explore area 2 and rescue any victims found"
+      plan: |
+        1. Move to area_2 door at [9, 4]
+        2. MoveNorth
+        3. Carry victim if it is in the nearby cells
+        4. Navigate to Drop Zone
+        5. Drop the victim at the drop zone
+
+  # --- Iteration 2 ---
+  - rescuebot0:
+      task: "Explore area 3 and rescue any victims found"
+      plan: |
+        1. Move to area_3 door at [15, 4]
+        2. Check for obstacles. If present, remove
+        3. Navigate inside area_3
+        4. Check NEARBY for victims.
+            - If a victim is found, carry it
+        5. Navigate to Drop Zone
+        6. Drop the victim at the drop zone
+    rescuebot1:
+      task: "Explore area 4 and rescue any victims found"
+      plan: |
+        1. Move to area_4 door at [21, 4]
+        2. Check for obstacles. If present, remove
+        3. Navigate inside area_4
+        4. Check NEARBY for victims.
+            - If a victim is found, carry it
+        5. Navigate to Drop Zone
+        6. Drop the victim at the drop zone
+
+
+# Override PlanningModule plans only — works with LLM task generation.
+# Comment out or remove this section if not needed.
+# agent_plans:
+#   rescuebot_0: |
+#     1. Explore the nearest unexplored area
+#     2. Search for victims
+#     3. Carry any found victim to the drop zone at [23, 8]
+#     4. Drop the victim at the drop zone
+#   rescuebot_1: |
+#     1. Explore the nearest unexplored area
+#     2. Search for victims
+#     3. Carry any found victim to the drop zone at [23, 8]
+#     4. Drop the victim at the drop zone
