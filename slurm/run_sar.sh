@@ -11,10 +11,14 @@
 #SBATCH --error=/scratch/%u/MAS/slurm_logs/%x-%j.err
 
 # --- Configuration (edit these) ---------------------------------------------
-MODEL_PATH="/scratch/ammarcu/MAS/models/qwen3-8b"
 PROJECT_DIR="/scratch/ammarcu/MAS/HULA_MAS"
 ENV_PREFIX="/scratch/ammarcu/.conda/envs/MAS-SAR"
 # ----------------------------------------------------------------------------
+
+# Model name: folder under /scratch/$USER/MAS/models/, overridable via MODEL_NAME.
+# Usage: sbatch --export=ALL,MODEL_NAME=qwen3-14b run_sar.sh
+MODEL_NAME="${MODEL_NAME:-qwen3-8b}"
+MODEL_PATH="/scratch/$USER/MAS/models/${MODEL_NAME}"
 
 module purge
 module load 2025
@@ -53,6 +57,6 @@ mkdir -p /scratch/$USER/MAS/slurm_logs
 cd "$PROJECT_DIR"
 nvidia-smi   # confirm GPU allocation
 
-echo "[run] RUN_NAME=${RUN_NAME}  OUTPUT=${SAR_LOG_DIR}/${RUN_NAME}"
+echo "[run] RUN_NAME=${RUN_NAME}  MODEL=${MODEL_NAME}  OUTPUT=${SAR_LOG_DIR}/${RUN_NAME}"
 python main.py
 echo "[done] Simulation completed."
