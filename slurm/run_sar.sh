@@ -1,44 +1,58 @@
 #!/bin/bash
 #SBATCH --job-name=sar-sim
-#SBATCH --partition=gpu-a100-small
-#SBATCH --time=00:15:00
+#SBATCH --partition=a100-small
+#SBATCH --time=01:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=2
-#SBATCH --mem-per-cpu=1G
+#SBATCH --cpus-per-task=8
+#SBATCH --gpus-per-task=1
+#SBATCH --mem-per-cpu=4G
 #SBATCH --account=education-eemcs-msc-cs
+#SBATCH --output=/scratch/%u/MAS/slurm_logs/%x-%j.out
+#SBATCH --error=/scratch/%u/MAS/slurm_logs/%x-%j.err
 
 # --- Configuration (edit these) ---------------------------------------------
-MODEL_PATH="/scratch/ammarcu/MAS/models/qwen3.5-9B"
-PROJECT_DIR="/scratch/ammarcu/MAS/SAR-env"
+MODEL_PATH="/scratch/ammarcu/MAS/models/qwen3-8b"
+PROJECT_DIR="/scratch/ammarcu/MAS/HULA_MAS"
+ENV_PREFIX="/scratch/ammarcu/.conda/envs/MAS-SAR"
 # ----------------------------------------------------------------------------
 
-# Load modules
-module load 2024r1
-module load python/3.10
-module load cuda/12.1
-module load openmpi
-module load py-pip
-module load py-numpy
-module load py-pyyaml
-module load py-tqdm
-module load ffmpeg
+module purge
+module load 2025
+module load miniconda3
 
-# Activate virtualenv
-source ~/sar-venv/bin/activate
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$ENV_PREFIX"
+
+# Headless display (MATRX imports may reference display; GUI is disabled in hpc_mode)
+export SDL_VIDEODRIVER=dummy
+export SDL_AUDIODRIVER=dummy
+export DISPLAY=
+export LIBGL_ALWAYS_SOFTWARE=1
+export MESA_GL_VERSION_OVERRIDE=3.3
+
+# HuggingFace — no internet on compute nodes
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_HOME="/scratch/$USER/.cache/huggingface"
+
+# Model path
+export SAR_MODEL_PATH="$MODEL_PATH"
+export LLM_ENABLE_THINKING=0
+
+# Base log directory (same for all runs)
+export SAR_LOG_DIR="/scratch/$USER/MAS/logs"
+
+# Experiment name: unique per run by default (job ID), overridable via RUN_NAME.
+# Usage: sbatch --export=ALL,RUN_NAME=experiment_A run_sar.sh
+RUN_NAME="${RUN_NAME:-job_${SLURM_JOB_ID}}"
+export SAR_EXPERIMENT_NAME="${RUN_NAME}"
+
+mkdir -p "$SAR_LOG_DIR"
+mkdir -p /scratch/$USER/MAS/slurm_logs
 
 cd "$PROJECT_DIR"
+nvidia-smi   # confirm GPU allocation
 
-# Point model loading to scratch (no internet on compute nodes)
-export SAR_MODEL_PATH="$MODEL_PATH"
-export HF_HOME="/scratch/$USER/.cache/huggingface"
-export TRANSFORMERS_CACHE="/scratch/$USER/.cache/huggingface"
-export HF_HUB_OFFLINE=1
-
-
-# --- Run SAR simulation -----------------------------------------------------
-# main.py reads SAR_MODEL_PATH and SAR_LOG_DIR automatically when hpc_mode=True
-echo "[run] Starting SAR simulation..."
+echo "[run] RUN_NAME=${RUN_NAME}  OUTPUT=${SAR_LOG_DIR}/${RUN_NAME}"
 python main.py
-
-
 echo "[done] Simulation completed."

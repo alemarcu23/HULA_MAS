@@ -68,6 +68,9 @@ if __name__ == "__main__":
 
     # Log directory (override with SAR_LOG_DIR env var for HPC)
     log_dir = os.environ.get('SAR_LOG_DIR', os.path.join(fld, 'logs'))
+    exp_name = os.environ.get('SAR_EXPERIMENT_NAME', None)
+    if exp_name:
+        log_dir = os.path.join(log_dir, exp_name)
 
     # Scale LLM thread pool for the number of agents
     init_marble_pool(
