@@ -82,7 +82,7 @@ def add_agents(builder, condition, name, folder, agent_type='baseline',
         include_human: Whether to add a keyboard-controlled human agent
         api_base: Base URL for the LLM inference server (shared by all agents)
         agent_model: Model name for rescue agents (e.g. 'qwen3:8b')
-        planning_mode: Planning strategy for MARBLE agents ('simple' or 'dag')
+        planning_mode: Planning strategy for agents ('simple' or 'dag')
         agent_presets: List of preset names or capability dicts, one per agent.
                        Defaults to all 'generalist'.
         capability_knowledge: 'informed' (agents know capabilities) or 'discovery'
@@ -107,8 +107,8 @@ def add_agents(builder, condition, name, folder, agent_type='baseline',
     sense_capability_human = SenseCapability({AgentBody: agent_sense_range, CollectableBlock: object_sense_range, None: other_sense_range, ObstacleObject: 1})
 
     agents = []
-    # Shared memory for MARBLE agents (thread-safe, one instance per run)
-    marble_shared_memory = SharedMemory()
+    # Shared memory for agents (thread-safe, one instance per run)
+    shared_memory = SharedMemory()
     for team in range(nr_teams):
         team_name = f"Team {team}"
         # Add the artificial agents based on condition and agent_type
@@ -125,7 +125,7 @@ def add_agents(builder, condition, name, folder, agent_type='baseline',
                 ObstacleObject: vision_range,
             })
 
-            if agent_type == 'marble':
+            if agent_type == 'baseline':
                 brain = SearchRescueAgent(
                     slowdown=8,
                     condition=condition,
@@ -134,7 +134,7 @@ def add_agents(builder, condition, name, folder, agent_type='baseline',
                     llm_model=agent_model,
                     strategy='react',
                     include_human=include_human,
-                    shared_memory=marble_shared_memory,
+                    shared_memory=shared_memory,
                     planning_mode=planning_mode,
                     api_base=api_base,
                     capabilities=caps,

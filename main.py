@@ -7,7 +7,7 @@ import time
 import threading
 from worlds1.WorldBuilder import create_builder
 from loggers.OutputLogger import output_logger
-from agents1.async_model_prompting import init_marble_pool, shutdown_marble_pool
+from agents1.async_model_prompting import init_agent_pool, shutdown_agent_pool
 from metrics.simulation_metrics import SimulationMetrics
 
 if __name__ == "__main__":
@@ -15,65 +15,72 @@ if __name__ == "__main__":
 
     # Register signal handlers for SLURM preemption / job timeout
 
-    # Configuration
-    condition = "normal"
-    name = "humanagent"
-    agent_type='marble'              # 'llm' | 'langgraph' | 'baseline'
-    ticks_per_iteration = 1200  # 1200 ticks * 0.1s/tick = 120 seconds = 2 minutes
-    num_rescue_agents = 2       # Number of LLM-based RescueAgents (1-5)
-    include_human = False        # Whether to add a keyboard-controlled human agent
-
-    # ---- Deployment mode ----
-    # False = local development (Ollama + GUI)
-    # True  = HPC / headless (in-process transformers, no server needed)
-    hpc_mode = True
-
+    # ── Deployment ──────────────────────────────────────────────────────────────
+    # hpc_mode=True:  headless HPC run (transformers backend, no GUI)
+    # hpc_mode=False: local dev    (Ollama backend, browser GUI at localhost:3000)
+    hpc_mode   = True
     enable_gui = not hpc_mode
-    llm_backend = 'transformers' if hpc_mode else 'ollama_sdk'
-    api_base = None if hpc_mode else "http://localhost:11434"
-    _hpc_model = os.environ.get('SAR_MODEL_PATH', 'Qwen/Qwen3-8B')
-    planner_model = _hpc_model if hpc_mode else 'qwen3:8b'
-    agent_model = _hpc_model if hpc_mode else 'qwen3:8b'
 
-    # Server ports (change to avoid conflicts when running multiple jobs on one node)
-    api_port = 3001         # MATRX API server port
-    vis_port = 3000         # Visualization server port
+    # ── LLM / Model ─────────────────────────────────────────────────────────────
+    # SAR_MODEL_PATH env var overrides the HPC model path (e.g. a local checkpoint).
+    llm_backend   = 'transformers' if hpc_mode else 'ollama_sdk'  # 'transformers' | 'ollama_sdk' | 'requests'
+    api_base      = None if hpc_mode else "http://localhost:11434"
+    _hpc_model    = os.environ.get('SAR_MODEL_PATH', 'Qwen/Qwen3-8B')
+    planner_model = _hpc_model if hpc_mode else 'qwen3:8b'  # model used by EnginePlanner
+    agent_model   = _hpc_model if hpc_mode else 'qwen3:8b'  # model used by RescueAgents
 
-    planning_mode = 'dag'        # 'simple' (flat list) or 'dag' (task graph with conditionals)
+    # ── Simulation & World ───────────────────────────────────────────────────────
+    condition     = "normal"  # human capability level: 'normal' | 'strong' | 'weak'
+    name          = "humanagent"
+    agent_type    = 'baseline'  # agent architecture
+    include_human = False     # True adds a keyboard-controlled human agent (Arrow keys / Q W A S D E)
 
-    # Agent capability presets — one per agent (cycles if fewer than num_rescue_agents)
-    # Available: 'scout', 'medic', 'heavy_lifter', 'generalist', or custom dicts
+    ticks_per_iteration = 1200  # ticks before replanning (1200 × 0.1 s = 2 min)
+
+    world_preset = 'static'  # 'static' | 'preset2' (2 houses) | 'preset3' (2 big houses) | 'random'
+    world_seed   = None      # int for reproducibility; None = random each run
+
+    # ── Agents ──────────────────────────────────────────────────────────────────
+    num_rescue_agents = 2  # number of AI RescueAgents (1–5)
+
+    # Capability preset per agent; cycles if list is shorter than num_rescue_agents.
+    # Options: 'scout', 'medic', 'heavy_lifter', 'generalist', or a custom dict.
     agent_presets = ['generalist', 'generalist']
-    # Whether agents know their capabilities upfront or discover through failure
-    capability_knowledge = 'informed'  # 'informed' | 'discovery'
 
-    # Communication strategies — one per agent (cycles if fewer than num_rescue_agents)
-    # Available: 'always_respond', 'busy_aware'
+    # 'informed'  = agents know their capabilities from the start
+    # 'discovery' = agents learn their capabilities by failing actions
+    capability_knowledge = 'informed'
+
+    # Communication strategy per agent; cycles if shorter than num_rescue_agents.
+    # 'always_respond' | 'busy_aware'
     comm_strategies = ['always_respond', 'always_respond']
 
-    # LLM backend is set by hpc_mode above. Override here if needed:
-    # llm_backend = 'ollama_sdk'  # 'ollama_sdk' | 'requests' | 'transformers'
+    # ── Planning ─────────────────────────────────────────────────────────────────
+    # 'simple' = flat task list; 'dag' = task graph with conditional branching
+    planning_mode = 'dag'
 
-    # World preset: 'static' (current world), 'preset2' (2 houses), 'preset3' (2 big houses), 'random'
-    world_preset = 'static'
-    world_seed = None            # int for reproducibility, None for random each run
-
-    # Set to a YAML file path to override LLM task/plan generation with manual inputs.
-    # See manual_plans.yaml for the expected format. Set to None to use LLM mode.
+    # Path to a YAML file to bypass LLM task generation with hand-written plans.
+    # See manual_plans.yaml for the expected format. None = use LLM mode.
     manual_plans_file = None  # e.g. "manual_plans.yaml"
 
-    # When True, an EnginePlanner agent coordinates task assignments via messages.
-    # When False, agents self-assign tasks using their own planning module.
+    # True  = EnginePlanner agent coordinates task assignments via messages
+    # False = agents self-assign tasks using their own planning module
     use_planner = False
 
-    # Log directory (override with SAR_LOG_DIR env var for HPC)
-    log_dir = os.environ.get('SAR_LOG_DIR', os.path.join(fld, 'logs'))
+    # ── Server ports ─────────────────────────────────────────────────────────────
+    # Change these to avoid conflicts when running multiple jobs on the same node.
+    api_port = 3001  # MATRX REST API
+    vis_port = 3000  # browser visualizer
+
+    # ── Logging ──────────────────────────────────────────────────────────────────
+    # SAR_LOG_DIR and SAR_EXPERIMENT_NAME env vars override these for HPC runs.
+    log_dir  = os.environ.get('SAR_LOG_DIR', os.path.join(fld, 'logs'))
     exp_name = os.environ.get('SAR_EXPERIMENT_NAME', None)
     if exp_name:
         log_dir = os.path.join(log_dir, exp_name)
 
     # Scale LLM thread pool for the number of agents
-    init_marble_pool(
+    init_agent_pool(
         num_rescue_agents, backend=llm_backend,
         preload_model=agent_model if hpc_mode else None,
     )
@@ -203,7 +210,7 @@ if __name__ == "__main__":
                 pass  # daemon thread will exit with process
 
         # Shut down LLM thread pool
-        shutdown_marble_pool()
+        shutdown_agent_pool()
 
         # Run output logger and stop builder
         try:

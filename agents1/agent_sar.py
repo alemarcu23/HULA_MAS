@@ -81,7 +81,7 @@ class PipelineStage(Enum):
 
 
 class SearchRescueAgent(LLMAgentBase):
-    """MARBLE-powered rescue agent with multi-stage cognitive pipeline.
+    """Rescue agent with multi-stage cognitive pipeline.
 
     Pipeline per cycle:
         [CRITIC] → COMMUNICATION → PLANNING → REASONING → EXECUTE

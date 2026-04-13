@@ -1,5 +1,5 @@
 """
-Engine package for MARBLE-style multi-agent coordination in MATRX.
+Engine package for multi-agent coordination in MATRX.
 
 This package implements the Engine and EnginePlanner classes for orchestrating
 decentralized multi-agent planning.

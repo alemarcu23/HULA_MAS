@@ -454,7 +454,7 @@ def _get_executor() -> ThreadPoolExecutor:
     return _executor
 
 
-def init_marble_pool(
+def init_agent_pool(
     num_agents: int = 1,
     backend: Optional[str] = None,
     preload_model: Optional[str] = None,
@@ -481,7 +481,7 @@ def init_marble_pool(
         _TransformersModel.get_instance(preload_model)
 
 
-def shutdown_marble_pool() -> None:
+def shutdown_agent_pool() -> None:
     """Shut down the executor pool, allowing pending tasks to finish."""
     global _executor
     if _executor is not None:
