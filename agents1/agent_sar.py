@@ -18,6 +18,7 @@ import re
 from enum import Enum
 from typing import Any, Dict, Optional, Tuple
 
+from helpers.logic_helpers import _chebyshev_distance
 from helpers.navigation_helpers import apply_navigation
 from matrx.agents.agent_utils.state import State
 from matrx.messages.message import Message
@@ -249,7 +250,7 @@ class SearchRescueAgent(LLMAgentBase):
                 self._pipeline_stage = PipelineStage.IDLE
                 return self._idle()
             if result is None:
-                return self._idle()
+                return self._idle(reason='llm_wait')
             self._pending_future = None
             return self._on_llm_result(result)
 
@@ -659,6 +660,28 @@ class SearchRescueAgent(LLMAgentBase):
             return check
 
         action_name, kwargs, task_completing = execute_action(name, args, self.agent_id)
+
+        # Solo Drop at drop zone → record the rescue in SharedMemory so that
+        # _get_rescued_victims() returns live data for the planning prompt.
+        if action_name == 'Drop' and self.shared_memory:
+            drop_zone = tuple(self.env_info.drop_zone)
+            if _chebyshev_distance(self.agent_location, drop_zone) <= 1:
+                carrying = self.WORLD_STATE.get('agent', {}).get('carrying', [])
+                if carrying:
+                    rescued_id = carrying[0]
+                    rescued = self.shared_memory.retrieve('rescued_victims') or []
+                    if not any(v['victim_id'] == rescued_id for v in rescued):
+                        rescued = rescued + [{
+                            'victim_id': rescued_id,
+                            'tick': self._tick_count,
+                            'agent': self.agent_id,
+                            'method': 'solo',
+                        }]
+                        self.shared_memory.update('rescued_victims', rescued)
+                        print(
+                            f'[{self.agent_id}] Recorded solo rescue of '
+                            f'{rescued_id} (total rescued: {len(rescued)})'
+                        )
 
         self.memory.update('action', {'action': action_name, 'args': kwargs})
         self._last_action = {'name': action_name, 'args': kwargs}

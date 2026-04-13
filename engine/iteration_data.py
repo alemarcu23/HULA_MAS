@@ -24,3 +24,4 @@ class IterationData:
     continue_simulation: bool = True  # Whether to continue to next iteration
     communications: List[str] = field(default_factory=list)  # Inter-agent messages
     score: float = 0.0  # Current simulation score
+    block_hit_rate: float = 0.0  # Fraction of victims rescued (0.0–1.0)

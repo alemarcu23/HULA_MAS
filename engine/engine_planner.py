@@ -209,6 +209,7 @@ class EnginePlanner(ArtificialAgentBrain):
                 'task_assignments': d.task_assignments,
                 'summary': d.summary,
                 'score': d.score,
+                'block_hit_rate': d.block_hit_rate,
             } for d in self.iteration_history],
         }
         path = os.path.join(log_dir, 'iteration_history.json')

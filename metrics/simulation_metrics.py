@@ -172,7 +172,7 @@ class SimulationMetrics:
             if not tracker:
                 continue
             total_actions = len(tracker.action_log)
-            total_ticks = tracker.idle_ticks + tracker.llm_wait_ticks + total_actions
+            total_ticks = getattr(agent, '_tick_count', 0) or (tracker.idle_ticks + tracker.llm_wait_ticks + total_actions)
             actions_per_agent[aid] = total_actions
 
             action_counts: Dict[str, int] = {}

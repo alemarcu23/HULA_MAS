@@ -1,13 +1,12 @@
 import os, requests
 import sys
 import json
-import signal
 import pathlib
 import time
-import threading
 from worlds1.WorldBuilder import create_builder
 from loggers.OutputLogger import output_logger
 from agents1.async_model_prompting import init_agent_pool, shutdown_agent_pool
+from metrics.agent_metrics import ActionFileLogger
 from metrics.simulation_metrics import SimulationMetrics
 
 if __name__ == "__main__":
@@ -94,6 +93,9 @@ if __name__ == "__main__":
     # Initialize score.json with defaults early (planner needs path at init)
     os.makedirs(log_dir, exist_ok=True)
     score_file = os.path.join(log_dir, 'score.json')
+
+    # Per-agent action CSV log (shared by all agents, written in real-time)
+    ActionFileLogger.init(os.path.join(log_dir, 'agent_actions.csv'))
 
     start_time = time.time()
 
@@ -186,6 +188,8 @@ if __name__ == "__main__":
                     'agent_presets': agent_presets,
                     'capability_knowledge': capability_knowledge,
                     'comm_strategies': comm_strategies,
+                    'condition': condition,
+                    'include_human': include_human,
                     'ticks_per_iteration': ticks_per_iteration,
                     'use_planner': use_planner,
                 },
@@ -208,6 +212,11 @@ if __name__ == "__main__":
                 vis_thread.join(timeout=5)
             except Exception:
                 pass  # daemon thread will exit with process
+
+        # Close per-agent action log
+        action_logger = ActionFileLogger.get()
+        if action_logger:
+            action_logger.close()
 
         # Shut down LLM thread pool
         shutdown_agent_pool()

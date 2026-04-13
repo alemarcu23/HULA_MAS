@@ -408,6 +408,24 @@ class LLMAgentBase(ArtificialBrain, Perception):
                 'result': 'delivered',
                 'victim_id': victim_id,
             })
+            if self.shared_memory:
+                # Record the rescue so plan() can report it via _get_rescued_victims().
+                # Use list-append semantics (not overwrite) so concurrent agents don't
+                # clobber each other's entries; the shared memory lock protects the
+                # read-modify-write sequence via retrieve() + update().
+                rescued = self.shared_memory.retrieve('rescued_victims') or []
+                if not any(v['victim_id'] == victim_id for v in rescued):
+                    rescued = rescued + [{
+                        'victim_id': victim_id,
+                        'tick': self._tick_count,
+                        'agent': self.agent_id,
+                        'method': 'cooperative',
+                    }]
+                    self.shared_memory.update('rescued_victims', rescued)
+                    print(
+                        f'[{self.agent_id}] Recorded cooperative rescue of '
+                        f'{victim_id} (total rescued: {len(rescued)})'
+                    )
             self._carry_autopilot = None
             if self.shared_memory:
                 self.shared_memory.update(SM_CARRY_AUTOPILOT, None)
@@ -510,6 +528,8 @@ class LLMAgentBase(ArtificialBrain, Perception):
             return tuple(self.WORLD_STATE.get('agent', {}).get('location', (0, 0)))
         return (0, 0)
 
-    def _idle(self) -> Tuple[str, Dict]:
-        """Convenience: return an Idle action."""
+    def _idle(self, reason: str = 'idle') -> Tuple[str, Dict]:
+        """Convenience: return an Idle action and record it in metrics."""
+        if self.metrics:
+            self.metrics.record_idle(self._tick_count, reason)
         return _Idle.__name__, {'duration_in_ticks': 1}

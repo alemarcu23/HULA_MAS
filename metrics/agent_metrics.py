@@ -5,6 +5,10 @@ Pure data class with zero dependencies on agent internals.
 Any agent type can instantiate and call record_*() methods.
 """
 
+import csv
+import json
+import os
+import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -12,6 +16,48 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 COOPERATIVE_ACTIONS = frozenset({
     'CarryObjectTogether', 'DropObjectTogether', 'RemoveObjectTogether',
 })
+
+
+class ActionFileLogger:
+    """Append-only CSV logger shared by all agents. Thread-safe."""
+    _instance: Optional['ActionFileLogger'] = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def init(cls, path: str) -> 'ActionFileLogger':
+        inst = cls(path)
+        cls._instance = inst
+        return inst
+
+    @classmethod
+    def get(cls) -> Optional['ActionFileLogger']:
+        return cls._instance
+
+    def __init__(self, path: str) -> None:
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        self._file = open(path, 'w', newline='')
+        self._writer = csv.writer(self._file)
+        self._writer.writerow([
+            'tick', 'agent_id', 'action_name', 'args', 'location', 'is_cooperative',
+        ])
+        self._file.flush()
+
+    def log(
+        self, tick: int, agent_id: str, action_name: str,
+        args: Dict, location: Tuple, is_cooperative: bool,
+    ) -> None:
+        with ActionFileLogger._lock:
+            self._writer.writerow([
+                tick, agent_id, action_name,
+                json.dumps(args, default=str), location, is_cooperative,
+            ])
+            self._file.flush()
+
+    def close(self) -> None:
+        try:
+            self._file.close()
+        except Exception:
+            pass
 
 
 class AgentMetricsTracker:
@@ -64,13 +110,17 @@ class AgentMetricsTracker:
             'location': location,
         }
         self.action_log.append(entry)
-        if action_name in COOPERATIVE_ACTIONS:
+        is_coop = action_name in COOPERATIVE_ACTIONS
+        if is_coop:
             self.cooperative_actions.append({
                 'tick': tick,
                 'action': action_name,
                 'partner': args.get('human_name', ''),
                 'object_id': args.get('object_id', ''),
             })
+        file_logger = ActionFileLogger.get()
+        if file_logger:
+            file_logger.log(tick, self.agent_id, action_name, args, location, is_coop)
 
     def record_message_sent(
         self, tick: int, to: str, message_type: str, text: str,
