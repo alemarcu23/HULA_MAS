@@ -8,6 +8,16 @@ Assess whether the last action advanced the current subtask. Exceeding requireme
 
 When the action fails, your critique MUST be actionable: state what went wrong, suggest a specific next action to try, and note any preconditions to verify first.
 
+Special rule: A MoveTo where the target coordinates match the agent's current position is ALWAYS a no-op failure, even if the move technically executed. Mark it success=false with critique explaining the agent must choose a different destination.
+
+Input fields reference:
+- current_task: The subtask the agent was trying to complete
+- last_action: The action that was just executed (name + arguments)
+- observation.agent: Agent's current state — location, carrying
+- observation.victims: Victims currently visible near the agent
+- observation.obstacles: Obstacles currently visible near the agent
+- all_observations: Global discovered objects across the whole map
+
 Respond with valid JSON only:
 {"reasoning": "what happened and why", "success": true/false, "critique": "actionable next step if failed, empty string if succeeded"}
 
@@ -54,6 +64,13 @@ Last action: MoveTo(x=9, y=4)
 Task: Explore Area 2
 RESPONSE:
 {"reasoning": "Agent moved to [9,5] but task is to explore Area 2. Movement happened but area exploration hasn't started yet — this is progress toward the task, not completion.", "success": false, "critique": "You are near Area 2 entrance at [9, 4]. Enter the area and search for victims inside."}
+
+INPUT:
+Position: [5,3], Carrying: None, Nearby: none
+Last action: MoveTo(x=5, y=3)
+Task: Navigate to victim at [8, 7]
+RESPONSE:
+{"reasoning": "MoveTo target (5, 3) is the agent's current position — this is a no-op. No movement occurred.", "success": false, "critique": "You tried to move to your own position. Choose a different destination closer to your target. Navigate toward [8, 7] instead."}
 """
 
 

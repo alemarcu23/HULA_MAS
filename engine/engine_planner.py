@@ -568,6 +568,14 @@ class EnginePlanner(ArtificialAgentBrain):
                     aid: self._strip_location_from_id(task)
                     for aid, task in result['tasks'].items()
                 }
+                # Prevent an agent being assigned a cooperative task that names
+                # only itself — replace the self-reference with another agent's ID.
+                other_ids = self._rescue_agent_ids
+                for aid, task in result['tasks'].items():
+                    if aid in task:
+                        partners = [o for o in other_ids if o != aid]
+                        if partners:
+                            result['tasks'][aid] = task.replace(aid, partners[0])
                 return result
 
         # Fallback if LLM fails

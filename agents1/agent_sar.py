@@ -15,6 +15,7 @@ import ast
 import json
 import logging
 import re
+from collections import deque
 from enum import Enum
 from typing import Any, Dict, Optional, Tuple
 
@@ -148,6 +149,18 @@ class SearchRescueAgent(LLMAgentBase):
         # messages each tick without duplicating entries already in memory.
         self._comm_msg_cursor: int = 0
 
+        # Communication throttle state
+        self._last_comm_tick: int = -1
+        self._last_task_at_comm: str = ''
+        self._last_msg_count_at_comm: int = 0
+
+        # Anti-loop detection: track last 3 executed actions
+        self._recent_actions: deque = deque(maxlen=3)
+        # Communication dedup: skip sending identical messages back-to-back
+        self._recent_sent_msgs: deque = deque(maxlen=3)
+        # Critic dedup: avoid injecting identical failure feedback twice in a row
+        self._last_critic_failure_critique: str = ''
+
         print(
             f'[SearchRescueAgent] Created '
             f'(model={llm_model}, strategy={self._strategy}, '
@@ -174,6 +187,8 @@ class SearchRescueAgent(LLMAgentBase):
         self._is_first_cycle = True
         self._last_action = {}
         self._comm_msg_cursor = 0
+        self._recent_actions.clear()
+        self._last_critic_failure_critique = ''
 
     # ── Perception ──────────────────────────────────────────────────────
 
@@ -338,15 +353,27 @@ class SearchRescueAgent(LLMAgentBase):
 
     # ── CRITIC stage ────────────────────────────────────────────────────
 
+    def _build_canonical_state(self) -> Dict[str, Any]:
+        """Return a consistent base state dict shared by all pipeline stages."""
+        agent_info = self.WORLD_STATE.get('agent', {})
+        return {
+            'position': agent_info.get('location'),
+            'carrying': agent_info.get('carrying'),
+            'current_task': self._current_task,
+            'last_action': self._last_action,
+            'critic_feedback': self._pipeline_context.get('critic_result'),
+            'tick': self._tick_count,
+        }
+
     def critic(self) -> Tuple[Optional[str], Dict]:
         last_name = self._last_action.get('name')
         if not last_name or last_name == 'Idle':
             self._pipeline_stage = PipelineStage.COMMUNICATION
             return self._advance_pipeline()
         
+        state = self._build_canonical_state()
         critic_inputs = {
-            'current_task': self._current_task,
-            'last_action': self._last_action,
+            **state,
             'observation': self.WORLD_STATE,
             'all_observations': self.WORLD_STATE_GLOBAL,
             'agent_capabilities': get_capability_prompt(self._capabilities) if self._capability_knowledge == 'informed' else None,
@@ -433,6 +460,21 @@ class SearchRescueAgent(LLMAgentBase):
         ]
 
     def communication_stage(self) -> Tuple[Optional[str], Dict]:
+        critic_failed = (
+            self._pipeline_context.get('critic_result') or {}
+        ).get('success') is False
+        current_msg_count = len(self.communication.get_messages(limit=999, agent_busy=False))
+        new_messages = current_msg_count > self._last_msg_count_at_comm
+        task_changed = self._current_task != self._last_task_at_comm
+
+        if not critic_failed and not new_messages and not task_changed:
+            self._pipeline_stage = PipelineStage.PLANNING
+            return self._advance_pipeline()
+
+        self._last_comm_tick = self._tick_count
+        self._last_task_at_comm = self._current_task
+        self._last_msg_count_at_comm = current_msg_count
+
         agent_info = self.WORLD_STATE.get('agent', {})
         comm_inputs = {
             'position': agent_info.get('location'),
@@ -464,21 +506,26 @@ class SearchRescueAgent(LLMAgentBase):
             message_text = text.strip()
 
         if message_text:
-            self.send_message(Message(
-                content={'message_type': 'message', 'text': message_text},
-                from_id=self.agent_id,
-                to_id=None,  # broadcast to all
-            ))
-            self.memory.update('sent_message', {
-                'entry_type': 'sent_message',
-                'to': 'all',
-                'type': 'coordination',
-                'text': message_text,
-                'tick': self._tick_count,
-            })
-            if self.metrics:
-                self.metrics.record_message_sent(self._tick_count, 'all', 'message', message_text)
-            print(f'[{self.agent_id}] Coordination msg: {message_text[:120]}')
+            # Skip if this exact message was sent recently (dedup)
+            if message_text in self._recent_sent_msgs:
+                print(f'[{self.agent_id}] Skipping duplicate coordination msg: {message_text[:80]}')
+            else:
+                self._recent_sent_msgs.append(message_text)
+                self.send_message(Message(
+                    content={'message_type': 'message', 'text': message_text},
+                    from_id=self.agent_id,
+                    to_id=None,  # broadcast to all
+                ))
+                self.memory.update('sent_message', {
+                    'entry_type': 'sent_message',
+                    'to': 'all',
+                    'type': 'coordination',
+                    'text': message_text,
+                    'tick': self._tick_count,
+                })
+                if self.metrics:
+                    self.metrics.record_message_sent(self._tick_count, 'all', 'message', message_text)
+                print(f'[{self.agent_id}] Coordination msg: {message_text[:120]}')
         else:
             print(f'[{self.agent_id}] Communication stage produced empty message, skipping')
 
@@ -492,14 +539,14 @@ class SearchRescueAgent(LLMAgentBase):
         agent_busy = self._nav_target is not None or self._carry_autopilot is not None
         raw_messages = self.communication.get_messages(limit=10, agent_busy=agent_busy)
 
+        state = self._build_canonical_state()
         planning_inputs = {
+            'agent_id': self.agent_id,
+            **state,
             'previous_tasks': self.memory.retrieve_all()[-5:],
-            'position': self.WORLD_STATE.get('agent', {}).get('location'),
             'nearby_objects': self.WORLD_STATE.get('victims', []) + self.WORLD_STATE.get('obstacles', []),
             'observed_objects': self.WORLD_STATE_GLOBAL,
-            'carrying': self.WORLD_STATE.get('agent', {}).get('carrying'),
             'rescued_victims': self._get_rescued_victims(),
-            'critic_feedback': self._pipeline_context.get('critic_result'),
             'area_exploration': self.area_tracker.get_all_summaries(),
             'messages': [
                 f"[{m['from']}] ({m['message_type']}) {m['text']}"
@@ -533,15 +580,33 @@ class SearchRescueAgent(LLMAgentBase):
             }
         observation['area_exploration'] = self.area_tracker.get_all_summaries()
 
+        state = self._build_canonical_state()
+        recent_actions_list = list(self._recent_actions)
         reasoning_inputs = {
+            **state,
             'task_decomposition': self._pipeline_context.get('planned_task', self._current_task),
             'observation': observation,
             'memory': self.memory.retrieve_all()[-15:],
-            'critic_feedback': self._pipeline_context.get('critic_result'),
+            'recent_actions': recent_actions_list,
             'agent_capabilities': get_capability_prompt(self._capabilities) if self._capability_knowledge == 'informed' else None,
             'game_rules': get_game_rules(drop_zone=self.env_info.drop_zone),
             'tools_available': list(self.tools_by_name.keys()),
         }
+
+        # Anti-loop injection: if all recent actions are identical, force a replan
+        if len(recent_actions_list) == 3 and len(set(
+            json.dumps(a, sort_keys=True) for a in recent_actions_list
+        )) == 1:
+            loop_msg = (
+                f'LOOP DETECTED: last 3 actions are identical ({recent_actions_list[0]}). '
+                f'You MUST try a completely different action type to make progress.'
+            )
+            self.memory.update('loop_warning', {'warning': loop_msg, 'tick': self._tick_count})
+            print(f'[{self.agent_id}] {loop_msg}')
+            # Inject loop warning into critic_feedback so reasoning sees it
+            if not isinstance(reasoning_inputs.get('critic_feedback'), dict):
+                reasoning_inputs['critic_feedback'] = {}
+            reasoning_inputs['critic_feedback']['loop_warning'] = loop_msg
         self._log_stage_inputs('REASONING', reasoning_inputs)
         prompt = self.reasoning.get_reasoning_prompt(reasoning_inputs)
         self.call_llm(prompt, tools=self.tool_schemas)
@@ -652,6 +717,15 @@ class SearchRescueAgent(LLMAgentBase):
         name = self._pipeline_context['action_name']
         args = self._pipeline_context['action_args']
 
+        if name == 'MoveTo':
+            planned = self._pipeline_context.get('planned_task') or self._current_task or ''
+            target_str = f"({args.get('x')}, {args.get('y')})"
+            if str(args.get('x')) not in planned and str(args.get('y')) not in planned:
+                print(
+                    f'[{self.agent_id}] MISMATCH: MoveTo{target_str} not found in '
+                    f'planned task: {planned[:120]!r}'
+                )
+
         # Validate
         check = self._validate_action(name, args)
         if check is not None:
@@ -685,6 +759,10 @@ class SearchRescueAgent(LLMAgentBase):
 
         self.memory.update('action', {'action': action_name, 'args': kwargs})
         self._last_action = {'name': action_name, 'args': kwargs}
+        self._recent_actions.append({'name': action_name, 'args': kwargs})
+
+        if task_completing and task_completing != 'N/A':
+            self.planner.advance_task(task_completing)
 
         if self.metrics:
             loc = self.WORLD_STATE.get('agent', {}).get('location', (0, 0))

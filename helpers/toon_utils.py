@@ -37,3 +37,7 @@ def to_toon(data) -> str:
     except Exception:
         print("Unexpected error in toon-format library. Falling back to custom encoder.")
         pass
+
+    # Fallback: compact JSON (no external dependencies)
+    import json
+    return json.dumps(data, default=str, indent=2)

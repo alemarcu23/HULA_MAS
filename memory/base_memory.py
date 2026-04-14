@@ -27,6 +27,14 @@ class BaseMemory:
             key (str): Only here to keep the signature consistent with SharedMemory.
             information (Any): Information to store.
         """
+        # Dedup: skip if information matches any of the last 3 entries
+        recent = list(self.storage)[-3:]
+        for last in recent:
+            if isinstance(information, dict) and isinstance(last, dict):
+                if information == last:
+                    return
+            elif information == last:
+                return
         self.storage.append(information)
 
     def retrieve_latest(self) -> Any:

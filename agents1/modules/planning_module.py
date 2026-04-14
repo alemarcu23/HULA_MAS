@@ -78,6 +78,23 @@ Bad outputs:
 - "Search the closest area for victims and rescue them."
 
 Return only the single best next task using all information available.
+
+Anti-self-assignment rule:
+- NEVER assign a cooperative task where the only named partner is yourself (agent_id).
+- Cooperative tasks (CarryObjectTogether, RemoveObjectTogether) must name a DIFFERENT agent as the partner.
+
+Input fields reference:
+- agent_id: YOUR agent identifier — never assign cooperative tasks with yourself as partner
+- position: Your current [x, y] location
+- current_task: The high-level mission task assigned to you
+- critic_feedback: Whether your last action succeeded or failed, with reason — if failed, adjust the task
+- previous_tasks: Your recent task history — avoid repeating failed tasks
+- nearby_objects: Victims and obstacles within your vision range
+- observed_objects: ALL objects ever discovered across the map
+- rescued_victims: Victims already delivered to the drop zone — do not re-rescue these
+- area_exploration: Coverage % per area — prioritize areas with lowest coverage
+- messages: Recent messages from teammates (help requests, status updates) — respond to ask_help first
+- agent_capabilities: Your physical capabilities (vision, strength, medical, speed) — only assign feasible tasks
 """
 
 _STOP_WORDS = frozenset({

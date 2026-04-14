@@ -115,6 +115,11 @@ class ActionValidator:
             return ValidationResult(False,
                 f'MoveTo target ({x}, {y}) is outside the grid '
                 f'(valid range: x=0-{self.GRID_WIDTH - 1}, y=0-{self.GRID_HEIGHT - 1}).')
+        agent_loc = _agent_location(ws)
+        if agent_loc is not None and (x, y) == (agent_loc[0], agent_loc[1]):
+            return ValidationResult(False,
+                f'MoveTo ({x}, {y}) is your current position — this is a no-op. '
+                f'Choose a different destination to make progress.')
         return _OK
 
     def _validate_navigate_to_drop_zone(self, args, ws, teammates):
