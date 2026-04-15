@@ -170,7 +170,12 @@ class LLMAgentBase(ArtificialBrain, Perception):
     # ── Default perception filter ─────────────────────────────────────────
 
     def filter_observations(self, state: State) -> State:
-        """Restrict observations to 1-block Chebyshev radius + doors + self.
+        """Restrict observations to the agent's vision radius + doors + self.
+
+        Vision radius is derived from the agent's capability preset:
+            low → 1 block, medium → 2 blocks, high → 3 blocks.
+        This mirrors the SenseCapability configured in WorldBuilder so that
+        the agent-side filter never discards objects MATRX legitimately passed.
 
         Saves the full unfiltered state to ``state_for_navigation`` for A*.
         Subclasses may override this for custom perception ranges.
@@ -179,6 +184,10 @@ class LLMAgentBase(ArtificialBrain, Perception):
         self.state_for_navigation = state.copy()
         filtered = state.copy()
         self.teammates = set()
+
+        # Derive vision radius from capability preset (low=1, medium=2, high=3)
+        vision_str = (self._capabilities or {}).get('vision', 'medium')
+        vision_radius = {'low': 1, 'medium': 2, 'high': 3}.get(vision_str, 2)
 
         keep = {self.agent_id, 'World'}
         if self._include_human:
@@ -194,7 +203,7 @@ class LLMAgentBase(ArtificialBrain, Perception):
             if isinstance(obj_id, str) and obj_id.startswith('rescuebot'):
                 keep.add(obj_id)
                 self.teammates.add((obj_id, state.get(obj_id, {}).get('location', [0, 0])))
-            if _chebyshev_distance(agent_loc, obj_data.get('location')) <= 1:
+            if _chebyshev_distance(agent_loc, obj_data.get('location')) <= vision_radius:
                 keep.add(obj_id)
             if 'door' in str(obj_id).lower():
                 keep.add(obj_id)

@@ -72,7 +72,9 @@ class Perception:
         partner_name = getattr(self, '_partner_name', None)
         include_human = getattr(self, '_include_human', False)
 
-        teammate_ids: set = set()
+        # Populate teammate IDs so rescuebot/human entries are correctly
+        # excluded from victim and obstacle lists in the global world belief.
+        teammate_ids: set = {t[0] for t in getattr(self, 'teammates', set())}
 
         # --- Nearby objects ---
         skip_ids = {self.agent_id, 'World'} | teammate_ids
