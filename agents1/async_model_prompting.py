@@ -147,6 +147,9 @@ def _completion_ollama_sdk(
     messages: list,
     max_token_num: int,
     temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
     tools: Optional[list],
     tool_choice: Optional[str],
     api_base: Optional[str],
@@ -161,7 +164,13 @@ def _completion_ollama_sdk(
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "options": {"num_predict": max_token_num, "temperature": temperature},
+        "options": {
+            "num_predict": max_token_num,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+        },
     }
     if tools:
         kwargs["tools"] = tools
@@ -207,6 +216,9 @@ def _completion_requests(
     messages: list,
     max_token_num: int,
     temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
     tools: Optional[list],
     tool_choice: Optional[str],
     api_base: Optional[str],
@@ -221,6 +233,9 @@ def _completion_requests(
         "messages": messages,
         "max_tokens": max_token_num,
         "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
         "stream": False,
     }
     if tools:
@@ -341,6 +356,9 @@ def _completion_transformers(
     messages: list,
     max_token_num: int,
     temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
     tools: Optional[list],
     tool_choice: Optional[str],
     api_base: Optional[str],
@@ -357,20 +375,20 @@ def _completion_transformers(
     template_kwargs = {
         "tokenize": False,
         "add_generation_prompt": True,
-        "enable_thinking": False,
+        "enable_thinking": True,
     }
     if tools:
         template_kwargs["tools"] = tools
 
-    # Build generate kwargs
+    # Always sample (never greedy) per Qwen3 best practices
     gen_kwargs = {
         "max_new_tokens": max_token_num,
+        "do_sample": True,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
     }
-    if temperature > 0:
-        gen_kwargs["do_sample"] = True
-        gen_kwargs["temperature"] = temperature
-    else:
-        gen_kwargs["do_sample"] = False
 
     # Serialize tokenization + GPU inference together for thread safety
     with mgr.generate_lock:
@@ -413,8 +431,11 @@ def _completion_transformers(
 def _llm_completion(
     llm_model: str,
     messages: list,
-    max_token_num: int = 512,
-    temperature: float = 0.0,
+    max_token_num: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
     tools: Optional[list] = None,
     tool_choice: Optional[str] = None,
     api_base: Optional[str] = None,
@@ -424,15 +445,15 @@ def _llm_completion(
 
     if _backend == "ollama_sdk":
         return _completion_ollama_sdk(
-            model, messages, max_token_num, temperature, tools, tool_choice, api_base
+            model, messages, max_token_num, temperature, top_p, top_k, min_p, tools, tool_choice, api_base
         )
     elif _backend == "requests":
         return _completion_requests(
-            model, messages, max_token_num, temperature, tools, tool_choice, api_base
+            model, messages, max_token_num, temperature, top_p, top_k, min_p, tools, tool_choice, api_base
         )
     elif _backend == "transformers":
         return _completion_transformers(
-            model, messages, max_token_num, temperature, tools, tool_choice, api_base
+            model, messages, max_token_num, temperature, top_p, top_k, min_p, tools, tool_choice, api_base
         )
     else:
         raise ValueError(f"Unknown LLM backend: {_backend!r}")
@@ -502,8 +523,11 @@ def shutdown_agent_pool() -> None:
 def submit_llm_call(
     llm_model: str,
     messages: List[Dict[str, str]],
-    max_token_num: int = 512,
-    temperature: float = 0.0,
+    max_token_num: int = 32768,
+    temperature: float = 0.6,
+    top_p: float = 0.95,
+    top_k: int = 20,
+    min_p: float = 0.0,
     tools: Optional[List[Dict[str, Any]]] = None,
     tool_choice: Optional[str] = None,
     api_base: Optional[str] = None,
@@ -513,11 +537,17 @@ def submit_llm_call(
 
     The Future's result will be ``List[_Message]`` on success.
 
+    Default sampling params follow Qwen3 thinking-mode best practices:
+    Temperature=0.6, TopP=0.95, TopK=20, MinP=0.
+
     Args:
         llm_model:     Model string, e.g. ``"ollama/llama3"`` or ``"qwen3:8b"``.
         messages:      OpenAI-style message list (role/content dicts).
         max_token_num: Max tokens for the completion.
         temperature:   Sampling temperature.
+        top_p:         Nucleus sampling probability threshold.
+        top_k:         Top-K sampling cutoff.
+        min_p:         Minimum probability threshold (0 = disabled).
         tools:         OpenAI-compatible tool schemas (optional).
         tool_choice:   ``'auto'``, ``'none'``, or a specific tool name.
         api_base:      Ollama base URL, e.g. ``"http://localhost:11434"``.
@@ -527,11 +557,14 @@ def submit_llm_call(
         _llm_completion,
         llm_model,
         messages,
-        max_token_num=max_token_num,
-        temperature=temperature,
-        tools=tools if tools else None,
-        tool_choice=tool_choice if tools else None,
-        api_base=api_base,
+        max_token_num,
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        tools if tools else None,
+        tool_choice if tools else None,
+        api_base,
     )
 
 
@@ -557,8 +590,11 @@ def call_llm_sync(
     llm_model: str,
     system_prompt: str,
     user_prompt: str,
-    max_token_num: int = 5000,
-    temperature: float = 0.4,
+    max_token_num: int = 32768,
+    temperature: float = 0.7,
+    top_p: float = 0.8,
+    top_k: int = 20,
+    min_p: float = 0.0,
     few_shot_messages: Optional[List[Dict]] = None,
     tools: Optional[list] = None,
     tool_choice: Optional[str] = None,
@@ -569,6 +605,9 @@ def call_llm_sync(
     Convenience wrapper for callers that manage their own threads
     (EnginePlanner, ShortTermMemory). Mirrors the old ``query_llm()`` signature.
 
+    Default sampling params follow Qwen3 non-thinking-mode best practices:
+    Temperature=0.7, TopP=0.8, TopK=20, MinP=0.
+
     Returns:
         The assistant's text content, or ``None`` on failure.
     """
@@ -576,7 +615,14 @@ def call_llm_sync(
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     if few_shot_messages:
-        messages.extend(few_shot_messages)
+        # Strip any <think> blocks from assistant history to keep context clean
+        cleaned = []
+        for msg in few_shot_messages:
+            if msg.get("role") == "assistant":
+                cleaned.append({**msg, "content": _strip_thinking(msg.get("content")) or ""})
+            else:
+                cleaned.append(msg)
+        messages.extend(cleaned)
     messages.append({"role": "user", "content": user_prompt})
 
     try:
@@ -585,6 +631,9 @@ def call_llm_sync(
             messages=messages,
             max_token_num=max_token_num,
             temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
             tools=tools,
             tool_choice=tool_choice,
             api_base=api_base,

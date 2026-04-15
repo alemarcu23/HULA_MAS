@@ -44,8 +44,11 @@ logger = logging.getLogger('LLMAgentBase')
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-MAX_NR_TOKENS: int = 5000
-TEMPERATURE: float = 0.3
+MAX_NR_TOKENS: int = 32768
+TEMPERATURE: float = 0.6   # Qwen3 thinking-mode recommended
+TOP_P: float = 0.95
+TOP_K: int = 20
+MIN_P: float = 0.0
 
 # SharedMemory key templates
 SM_CARRY_AUTOPILOT = 'carry_autopilot'
@@ -523,6 +526,9 @@ class LLMAgentBase(ArtificialBrain, Perception):
             messages=messages,
             max_token_num=MAX_NR_TOKENS,
             temperature=TEMPERATURE,
+            top_p=TOP_P,
+            top_k=TOP_K,
+            min_p=MIN_P,
             tools=tools,
             tool_choice=tool_choice if tools else 'none',
             api_base=self._api_base,
