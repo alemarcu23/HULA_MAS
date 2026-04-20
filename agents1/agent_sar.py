@@ -26,7 +26,7 @@ from matrx.messages.message import Message
 
 from agents1.async_model_prompting import get_llm_result
 from agents1.capabilities import filter_tools_for_capabilities, get_capability_prompt, get_game_rules
-from agents1.llm_agent_base import LLMAgentBase
+from agents1.llm_agent_base import LLMAgentBase, SM_TASK_ASSIGNMENTS
 from agents1.modules.area_tracker import AreaExplorationTracker
 from agents1.modules.execution_module import execute_action
 from agents1.modules.reasoning_module import ReasoningIO
@@ -449,7 +449,6 @@ class SearchRescueAgent(LLMAgentBase):
             f'Current task: {self._current_task}\n'
             f'Position: {position}\n'
             f'Carrying: {carrying}\n'
-            f'Critic feedback: {self._pipeline_context.get("critic_result", "None")}\n\n'
             f'Area exploration status:\n{area_status}\n\n'
             f'Recent teammate messages:\n{teammate_msgs}'
         )
@@ -561,9 +560,15 @@ class SearchRescueAgent(LLMAgentBase):
 
     def _handle_planning_result(self, result) -> Tuple[Optional[str], Dict]:
         text = getattr(result[0], 'content', '') or ''
-        self._pipeline_context['planned_task'] = text.strip()
-        self.memory.update('planned_task', {'task': text.strip(), 'tick': self._tick_count})
-        print(f'[{self.agent_id}] Planned task: {text.strip()[:100]}')
+        task = text.strip()
+        self._pipeline_context['planned_task'] = task
+        self.memory.update('planned_task', {'task': task, 'tick': self._tick_count})
+        print(f'[{self.agent_id}] Planned task: {task[:100]}')
+
+        if task:
+            # Persist as current task so COMMUNICATION/CRITIC/REASONING all see it.
+            # Direct assignment avoids the full pipeline reset that set_current_task() triggers.
+            self._current_task = task
 
         self._pipeline_stage = PipelineStage.REASONING
         return self._advance_pipeline()

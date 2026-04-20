@@ -17,7 +17,7 @@ if __name__ == "__main__":
     # ── Deployment ──────────────────────────────────────────────────────────────
     # hpc_mode=True:  headless HPC run (transformers backend, no GUI)
     # hpc_mode=False: local dev    (Ollama backend, browser GUI at localhost:3000)
-    hpc_mode   = True
+    hpc_mode   = False
     enable_gui = not hpc_mode
 
     # ── LLM / Model ─────────────────────────────────────────────────────────────
@@ -198,6 +198,17 @@ if __name__ == "__main__":
             metrics_path = os.path.join(log_dir, 'simulation_metrics.json')
             sim_metrics.save(metrics_path, report)
             print(f"Saved simulation metrics to {metrics_path}")
+
+            # Enrich score.json with agent-derived metrics
+            perf = report.get('task_performance', {})
+            if os.path.exists(score_file):
+                with open(score_file) as f:
+                    score_data = json.load(f)
+                score_data['victims_found'] = perf.get('victims_found', 0)
+                score_data['obstacles_removed'] = perf.get('obstacles_removed', 0)
+                score_data['cells_explored'] = perf.get('cells_explored', 0)
+                with open(score_file, 'w') as f:
+                    json.dump(score_data, f, indent=2)
         except Exception as e:
             print(f"[main] Failed to save simulation metrics: {e}", file=sys.stderr)
 
@@ -223,7 +234,7 @@ if __name__ == "__main__":
 
         # Run output logger and stop builder
         try:
-            output_logger(fld)
+            output_logger(fld, log_dir=log_dir)
         except Exception as e:
             print(f"[main] Output logger error: {e}", file=sys.stderr)
 

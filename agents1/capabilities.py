@@ -37,7 +37,7 @@ CAPABILITY_PRESETS: Dict[str, Dict[str, Any]] = {
     'generalist': {
         'vision': 'medium',
         'strength': 'medium',
-        'medical': 'low',
+        'medical': 'medium',
         'speed': 'normal',
     },
 }
@@ -169,8 +169,24 @@ def get_game_rules(drop_zone=(23, 8)) -> str:
     dz = drop_zone
     base_rules = [
         "Goal:",
-        f"- Search for victims in the areas and rescue them by dropping them at the drop zone at {dz}.",
+        f"- Search all areas for victims and rescue them by carrying them to the drop zone at {dz} and using Drop.",
         "- You can only carry one victim at a time.",
+        "",
+        "Carrying victims:",
+        "- Mildly injured victim: use CarryObject (solo) if your medical capability allows, then NavigateToDropZone, then Drop.",
+        "- Critically injured victim: use CarryObjectTogether with a partner (both must be adjacent to the victim first).",
+        "- After carrying, always navigate to the drop zone and Drop the victim there to score points.",
+        "",
+        "Removing obstacles:",
+        "- Small stone: use RemoveObject (solo). You must be adjacent (distance ≤ 1).",
+        "- Fallen tree: use RemoveObject (solo, rescue robot only).",
+        "- Big grey rock: use RemoveObjectTogether with a partner (both must be adjacent).",
+        "- Remove obstacles that are blocking your path to victims or areas.",
+        "",
+        "Navigation:",
+        "- Use MoveTo(x, y) or MoveToArea(area) to navigate. You must be adjacent to an object to interact with it.",
+        "- Use EnterArea(area) when you are at the door of an area to enter it.",
+        "- Use SearchArea(area) to systematically cover all cells in an area.",
     ]
 
     return '\n'.join(base_rules)

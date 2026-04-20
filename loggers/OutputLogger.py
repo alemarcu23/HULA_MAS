@@ -5,8 +5,8 @@ import glob
 import pathlib
 
 
-def output_logger(fld):
-    log_base = os.path.join(fld, 'logs')
+def output_logger(fld, log_dir=None):
+    log_base = log_dir if log_dir else os.path.join(fld, 'logs')
     if not os.path.isdir(log_base):
         print(f"No logs directory found at {log_base}")
         return

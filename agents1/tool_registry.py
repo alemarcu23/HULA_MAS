@@ -100,13 +100,6 @@ def MoveTo(x: int, y: int, task_completing: str):
     return 'MoveTo', {'x': x, 'y': y, 'task_completing': task_completing}
 
 @tool
-def EnterArea(area:int, task_completing: str):
-    """When at the door of an area, if the path is not blocked, enter it.
-    """
-    return 'EnterArea', {'area': area}, {'task_completing': task_completing}
-
-
-@tool
 def MoveToArea(area: int, task_completing: str):
     """Navigate to a specific Area using A* pathfinding.
 
@@ -181,17 +174,6 @@ def RemoveObjectTogether(object_id: str, partner_id: str, task_completing: str =
     """
     return 'RemoveObjectTogether', {'object_id': object_id, 'partner_id': partner_id}, {'task_completing': task_completing}
 
-
-@tool
-def Idle(duration_in_ticks: int = 1):
-    """Do nothing for the specified number of ticks.
-    Use when waiting for a partner agent or an expected event.
-
-    Args:
-        duration_in_ticks: Number of ticks to wait (default 1).
-    """
-    return 'Idle', {'duration_in_ticks': duration_in_ticks}, {'task_completing': f"idling for {duration_in_ticks} ticks"}
-
 @tool
 def SearchArea(area: int, task_completing: str = "searching area"):
     """Systematically search all cells inside an area for victims and obstacles.
@@ -221,11 +203,10 @@ def SendMessage(message: str, send_to: str, message_type: str = "message"):
 # Ordered list of every action tool — used to build the registry + LLM schemas.
 ALL_ACTION_TOOLS = [
     MoveNorth, MoveSouth, MoveEast, MoveWest,
-    MoveTo, NavigateToDropZone, MoveToArea, EnterArea, SearchArea,
+    MoveTo, NavigateToDropZone, MoveToArea, SearchArea,
     CarryObject, CarryObjectTogether,
     Drop,
-    RemoveObject, RemoveObjectTogether,
-    Idle, SendMessage
+    RemoveObject, RemoveObjectTogether, SendMessage
 ]
 
 

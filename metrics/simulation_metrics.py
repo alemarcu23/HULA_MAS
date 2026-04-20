@@ -8,8 +8,22 @@ produce a single comprehensive JSON report.
 
 import json
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
+
+_THINK_RE = re.compile(r'<think>.*?</think>', re.DOTALL)
+
+
+def _strip_thinking(obj):
+    """Recursively strip <think>…</think> blocks from all strings in a nested structure."""
+    if isinstance(obj, str):
+        return _THINK_RE.sub('', obj).strip()
+    if isinstance(obj, dict):
+        return {k: _strip_thinking(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_strip_thinking(v) for v in obj]
+    return obj
 
 from metrics.agent_metrics import AgentMetricsTracker
 
@@ -113,6 +127,19 @@ class SimulationMetrics:
                 aid: len(cells) for aid, cells in per_agent_cells.items()
             },
         }
+
+        # Count obstacles removed across all agents
+        _REMOVE_ACTIONS = {'RemoveObject', 'RemoveObjectTogether'}
+        obstacles_removed = 0
+        for agent in agent_list:
+            tracker = self._get_tracker(agent)
+            if tracker:
+                obstacles_removed += sum(
+                    1 for a in tracker.action_log
+                    if a.get('action_name') in _REMOVE_ACTIONS
+                )
+        result['task_performance']['obstacles_removed'] = obstacles_removed
+        result['task_performance']['cells_explored'] = len(union_cells)
 
         # ── Communication ────────────────────────────────────────────────
         total_messages = 0
@@ -284,6 +311,7 @@ class SimulationMetrics:
     def save(self, path: str, results: Optional[Dict] = None) -> None:
         if results is None:
             results = {}
+        results = _strip_thinking(results)
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         with open(path, 'w') as f:
             json.dump(results, f, indent=2, default=str)
