@@ -84,7 +84,7 @@ class ReasoningIO(ReasoningBase):
             )
             system_content = warning + system_content
 
-        print("Generating reasoning prompt with information:", json.dumps(info_dict, indent=2, default=str))
+        print("Generating reasoning prompt with information:", json.dumps(to_toon(info_dict), indent=2, default=str))
         return [
             {"role": "system", "content": system_content},
             {"role": "user",   "content": to_toon(info_dict)},

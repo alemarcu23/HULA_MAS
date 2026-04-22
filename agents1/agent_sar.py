@@ -244,7 +244,6 @@ class SearchRescueAgent(LLMAgentBase):
 
     def decide_on_actions(self, filtered_state: State) -> Tuple[Optional[str], Dict]:
         self.update_knowledge(filtered_state)
-        print(self._pipeline_stage)
 
         # if not self._current_task:
         #     if self._use_planner and not self._received_planner_task:

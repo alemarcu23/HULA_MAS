@@ -266,10 +266,11 @@ def preset_static(seed=None, **kwargs) -> WorldPreset:
 
     # ── Victim placement ──────────────────────────────────────────────────────
     # Each room gets 1 or 2 victims at random non-overlapping interior cells.
-    # The potential obstacle cell (door_x, door_y-1) is excluded so victims
-    # never block the obstacle spawn point in North-entry rooms.
+    # obs_potential is the cell just inside the door (direction depends on entry
+    # side) — excluded from victim placement to avoid blocking the obstacle spot.
     # Guarantee ≥5 critical: the first victim in each of rooms[0..4] is always
-    # drawn from CRITICAL; all other placements pick randomly between pools.
+    # drawn from CRITICAL. All other slots favour MILD 70/30 to produce more
+    # yellow (mildly injured) victims across the map.
 
     _CRITICAL = [
         ('critically injured girl',          '/images/critically injured girl.svg'),
@@ -286,7 +287,10 @@ def preset_static(seed=None, **kwargs) -> WorldPreset:
 
     for idx, room in enumerate(rooms):
         interior = _interior_cells(room)
-        obs_potential = (room.door[0], room.door[1] - 1)
+        # South rooms: door is on top wall, obstacle goes one cell down (into room).
+        # North rooms: door is on bottom wall, obstacle goes one cell up (into room).
+        obs_dy = 1 if room.enter_direction == 'South' else -1
+        obs_potential = (room.door[0], room.door[1] + obs_dy)
         available = [c for c in interior if c != room.door and c != obs_potential]
         n_victims = rng.randint(1, 2)
         used: set = set()
@@ -296,13 +300,18 @@ def preset_static(seed=None, **kwargs) -> WorldPreset:
                 break
             loc = rng.choice(avail)
             used.add(loc)
-            pool = _CRITICAL if (idx < 5 and j == 0) else rng.choice([_CRITICAL, _MILD])
+            if idx < 5 and j == 0:
+                pool = _CRITICAL
+            else:
+                pool = rng.choices([_CRITICAL, _MILD], weights=[1, 3], k=1)[0]
             name, img = rng.choice(pool)
             room.victims.append(VictimDef(name=name, img=img,
                                           location=loc, area=f'area {room.id}'))
 
     # ── Obstacle placement ────────────────────────────────────────────────────
-    # 10 of 14 rooms receive one obstacle at their door entrance.
+    # 10 of 14 rooms receive one obstacle just inside their door entrance.
+    # South-entry rooms: obstacle at door[1]+1 (one cell below the top door).
+    # North-entry rooms: obstacle at door[1]-1 (one cell above the bottom door).
     # Exactly 4 rocks are guaranteed by building the type list before shuffling.
 
     _OBS_NON_ROCK = [
@@ -319,16 +328,17 @@ def preset_static(seed=None, **kwargs) -> WorldPreset:
     for i, room_idx in enumerate(room_indices[:10]):
         room = rooms[room_idx]
         obs_name, obs_img = obs_type_list[i]
+        obs_dy = 1 if room.enter_direction == 'South' else -1
         room.obstacles.append(ObstacleDef(
             name=obs_name, img=obs_img,
-            location=[room.door[0], room.door[1] - 1],
+            location=[room.door[0], room.door[1] + obs_dy],
         ))
 
     # ── Ghost victims and drop zone ───────────────────────────────────────────
-    # One ghost block per actual victim so progress tracks full rescue.
+    # Fixed 8 ghost blocks (one per victim type) keeps the drop zone compact.
     # Grid expanded to 30×30; drop zone at x=28 (clear of all rooms ≤x=23).
-    ghost_victims = _collect_all_victims(rooms)
-    total_victims = len(ghost_victims)
+    ghost_victims = list(VICTIM_POOL)
+    total_victims = sum(len(r.victims) for r in rooms)
 
     # ── Decorative overrides (unchanged — covers all 14 rooms visually) ───────
     decorative_overrides = {
@@ -376,10 +386,10 @@ def preset_static(seed=None, **kwargs) -> WorldPreset:
 
     return WorldPreset(
         name='static',
-        grid_width=30,
-        grid_height=30,
+        grid_width=25,
+        grid_height=24,
         rooms=rooms,
-        drop_zone=DropZoneDef((28, 1), total_victims),
+        drop_zone=DropZoneDef((23, 8), 8),
         ghost_victims=ghost_victims,
         decorative_overrides=decorative_overrides,
         seed=seed,

@@ -122,7 +122,7 @@ class Planning:
             self.task_graph = TaskGraph.from_task_list(decomposition)
                 
     def get_planning_prompt(self, information: Dict[str, Any]) -> List[Dict[str, str]]:
-        print("Generating planning prompt with information:", json.dumps(information, indent=2, default=str))
+        print("Generating planning prompt with information:", json.dumps(to_toon(information), indent=2, default=str))
 
         # Inject capability-aware game rules into the system prompt
         game_rules = information.get('game_rules', '')
