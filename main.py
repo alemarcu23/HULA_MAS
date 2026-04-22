@@ -1,3 +1,4 @@
+import argparse
 import os, requests
 import sys
 import json
@@ -12,12 +13,17 @@ from metrics.simulation_metrics import SimulationMetrics
 if __name__ == "__main__":
     fld = os.getcwd()
 
-    # Register signal handlers for SLURM preemption / job timeout
+    parser = argparse.ArgumentParser(description="HULA-MAS Search and Rescue simulation")
+    parser.add_argument('--preset', type=str, default=None,
+                        help="World preset name (e.g. 'static', 'mild_trees', 'random')")
+    parser.add_argument('--num_agents', type=int, default=None,
+                        help="Number of AI rescue agents (1–5)")
+    args = parser.parse_args()
 
     # ── Deployment ──────────────────────────────────────────────────────────────
     # hpc_mode=True:  headless HPC run (transformers backend, no GUI)
     # hpc_mode=False: local dev    (Ollama backend, browser GUI at localhost:3000)
-    hpc_mode   = True
+    hpc_mode   = False
     enable_gui = not hpc_mode
 
     # ── LLM / Model ─────────────────────────────────────────────────────────────
@@ -36,11 +42,11 @@ if __name__ == "__main__":
 
     ticks_per_iteration = 1200  # ticks before replanning (1200 × 0.1 s = 2 min)
 
-    world_preset = 'static'  # 'static' | 'preset2' (2 houses) | 'preset3' (2 big houses) | 'random'
+    world_preset = args.preset if args.preset is not None else 'mild_trees'
     world_seed   = None      # int for reproducibility; None = random each run
 
     # ── Agents ──────────────────────────────────────────────────────────────────
-    num_rescue_agents = 2  # number of AI RescueAgents (1–5)
+    num_rescue_agents = args.num_agents if args.num_agents is not None else 2
 
     # Capability preset per agent; cycles if list is shorter than num_rescue_agents.
     # Options: 'scout', 'medic', 'heavy_lifter', 'generalist', or a custom dict.

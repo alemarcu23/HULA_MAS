@@ -236,14 +236,10 @@ def generate_area_signs(rooms: List[RoomDef]) -> List[Tuple[Tuple[int, int], int
     return signs
 
 
-# ── Preset: static (14-room world with randomised victims and obstacles) ──────
+# ── Shared room/decoration builder for the 14-room world ────────────────────
 
-def preset_static(seed=None, **kwargs) -> WorldPreset:
-    """14-room world with 1–2 random victims per room (≥5 critical) and
-    obstacles at 10/14 room entrances (≥4 big rocks). Seeded for reproducibility."""
-    rng = random.Random(seed)
-
-    rooms = [
+def _build_14_rooms() -> List[RoomDef]:
+    return [
         # Row 1 — North entry (door on bottom wall)
         RoomDef(1,  (1,  1),  5, 4, (3,  4),  (3,  5),  'North'),
         RoomDef(2,  (7,  1),  5, 4, (9,  4),  (9,  5),  'North'),
@@ -264,13 +260,59 @@ def preset_static(seed=None, **kwargs) -> WorldPreset:
         RoomDef(14, (19, 19), 5, 4, (21, 19), (21, 18), 'South'),
     ]
 
-    # ── Victim placement ──────────────────────────────────────────────────────
-    # Each room gets 1 or 2 victims at random non-overlapping interior cells.
-    # obs_potential is the cell just inside the door (direction depends on entry
-    # side) — excluded from victim placement to avoid blocking the obstacle spot.
-    # Guarantee ≥5 critical: the first victim in each of rooms[0..4] is always
-    # drawn from CRITICAL. All other slots favour MILD 70/30 to produce more
-    # yellow (mildly injured) victims across the map.
+
+_STATIC_DECORATIONS: Dict[str, Any] = {
+    'roof_tiles': [
+        (1,1),(2,1),(3,1),(4,1),(5,1),(1,2),(1,3),(1,4),(2,4),(4,4),(5,4),(5,3),(5,2),(7,1),(8,1),(9,1),
+        (10,1),(11,1),(7,2),(7,3),(7,4),(8,4),(11,2),(11,3),(11,4),(10,4),(16,4),(17,4),(17,3),(17,2),
+        (13,1),(14,1),(15,1),(16,1),(17,1),(13,2),(13,3),(13,4),(14,4),
+        (19,1),(20,1),(21,1),(22,1),(23,1),(19,2),(19,3),(19,4),(20,4),(22,4),(23,4),(23,3),(23,2),
+        (1,7),(1,8),(1,9),(1,10),(2,10),(3,10),(4,10),(5,10),(5,9),(5,8),(5,7),(4,7),(2,7),
+        (13,7),(13,8),(13,9),(13,10),(14,10),(15,10),(16,10),(17,10),(17,9),(17,8),(17,7),(16,7),(14,7),
+        (1,13),(2,13),(3,13),(4,13),(5,13),(1,14),(1,15),(1,16),(2,16),(4,16),(5,16),(5,15),(5,14),
+        (7,13),(8,13),(9,13),(10,13),(11,13),(7,14),(7,15),(7,16),(8,16),(10,16),(11,16),(11,15),(11,14),
+        (13,13),(14,13),(15,13),(16,13),(17,13),(13,14),(13,15),(13,16),(14,16),(17,14),(17,15),(17,16),(16,16),
+        (1,19),(2,19),(4,19),(5,19),(1,20),(1,21),(1,22),(2,22),(3,22),(4,22),(5,22),(5,21),(5,20),
+        (7,19),(8,19),(4,19),(5,19),(7,20),(7,21),(7,22),(8,22),(9,22),(10,22),(11,22),(11,21),(11,20),(11,19),
+        (13,19),(14,19),(16,19),(17,19),(13,20),(13,21),(13,22),(14,22),(15,22),(16,22),(17,22),(17,21),(17,20),
+        (19,19),(20,19),(22,19),(23,19),(19,20),(19,21),(19,22),(20,22),(21,22),(22,22),(23,22),(23,21),(23,20),
+        (7,7),(7,8),(7,9),(7,10),(8,10),(9,10),(10,10),(11,10),(11,9),(11,8),(11,7),(10,7),(8,7),(10,19),
+    ],
+    'street_tiles': [
+        (11,5),(13,5),(14,5),(13,6),(14,6),(12,5),(15,5),(15,6),(16,5),(16,6),(17,5),(17,6),(18,5),
+        (8,6),(7,6),(6,6),(5,6),(4,6),(3,6),(2,6),(1,6),(20,9),(21,9),(21,14),(20,14),(19,14),(9,6),
+        (1,5),(2,5),(3,5),(4,5),(5,5),(22,11),(22,12),(19,18),(18,18),(17,18),(16,18),(15,18),(13,17),
+        (11,17),(10,17),(8,18),(7,18),(6,18),(5,18),(4,18),(3,18),(2,18),(1,18),(12,17),(18,6),
+    ],
+    'street_tiles_alt': [
+        (21,10),(21,11),(21,12),(21,13),(19,15),(19,16),
+    ],
+    'plants': [
+        (12,3),(12,4),(18,1),(18,2),(18,3),(18,4),(6,19),(6,20),(6,21),(18,19),
+    ],
+    'decorative_objects': [
+        {'pos': (1, 12), 'name': 'plant', 'img': '/images/tree.svg', 'size': 3},
+        {'pos': (21, 7), 'name': 'heli', 'img': '/images/helicopter.svg', 'size': 3, 'traversable': False},
+        {'pos': (21, 16), 'name': 'ambulance', 'img': '/images/ambulance.svg', 'size': 2.3, 'traversable': False},
+    ],
+    'keyboard_sign': (12, 0),
+    'area_signs': [
+        ((3,1), '01', 0.5), ((9,1), '02', 0.55), ((15,1), '03', 0.55), ((21,1), '04', 0.55),
+        ((3,10), '05', 0.55), ((9,10), '06', 0.55), ((15,10), '07', 0.55),
+        ((3,13), '08', 0.55), ((9,13), '09', 0.55), ((15,13), '10', 0.55),
+        ((3,22), '11', 0.45), ((9,22), '12', 0.55), ((15,22), '13', 0.55), ((21,22), '14', 0.55),
+    ],
+}
+
+
+# ── Preset: static (mixed victims and obstacles) ─────────────────────────────
+
+def preset_static(seed=None, **kwargs) -> WorldPreset:
+    """14-room world with 1–2 random victims per room (≥5 critical, 75% mild
+    for non-guaranteed slots) and mixed obstacles at 10/14 entrances (≥4 rocks).
+    Seeded for reproducibility."""
+    rng = random.Random(seed)
+    rooms = _build_14_rooms()
 
     _CRITICAL = [
         ('critically injured girl',          '/images/critically injured girl.svg'),
@@ -287,8 +329,6 @@ def preset_static(seed=None, **kwargs) -> WorldPreset:
 
     for idx, room in enumerate(rooms):
         interior = _interior_cells(room)
-        # South rooms: door is on top wall, obstacle goes one cell down (into room).
-        # North rooms: door is on bottom wall, obstacle goes one cell up (into room).
         obs_dy = 1 if room.enter_direction == 'South' else -1
         obs_potential = (room.door[0], room.door[1] + obs_dy)
         available = [c for c in interior if c != room.door and c != obs_potential]
@@ -307,12 +347,6 @@ def preset_static(seed=None, **kwargs) -> WorldPreset:
             name, img = rng.choice(pool)
             room.victims.append(VictimDef(name=name, img=img,
                                           location=loc, area=f'area {room.id}'))
-
-    # ── Obstacle placement ────────────────────────────────────────────────────
-    # 10 of 14 rooms receive one obstacle just inside their door entrance.
-    # South-entry rooms: obstacle at door[1]+1 (one cell below the top door).
-    # North-entry rooms: obstacle at door[1]-1 (one cell above the bottom door).
-    # Exactly 4 rocks are guaranteed by building the type list before shuffling.
 
     _OBS_NON_ROCK = [
         ('stone', '/images/stone-small.svg'),
@@ -334,64 +368,68 @@ def preset_static(seed=None, **kwargs) -> WorldPreset:
             location=[room.door[0], room.door[1] + obs_dy],
         ))
 
-    # ── Ghost victims and drop zone ───────────────────────────────────────────
-    # Fixed 8 ghost blocks (one per victim type) keeps the drop zone compact.
-    # Grid expanded to 30×30; drop zone at x=28 (clear of all rooms ≤x=23).
-    ghost_victims = list(VICTIM_POOL)
-    total_victims = sum(len(r.victims) for r in rooms)
-
-    # ── Decorative overrides (unchanged — covers all 14 rooms visually) ───────
-    decorative_overrides = {
-        'roof_tiles': [
-            (1,1),(2,1),(3,1),(4,1),(5,1),(1,2),(1,3),(1,4),(2,4),(4,4),(5,4),(5,3),(5,2),(7,1),(8,1),(9,1),
-            (10,1),(11,1),(7,2),(7,3),(7,4),(8,4),(11,2),(11,3),(11,4),(10,4),(16,4),(17,4),(17,3),(17,2),
-            (13,1),(14,1),(15,1),(16,1),(17,1),(13,2),(13,3),(13,4),(14,4),
-            (19,1),(20,1),(21,1),(22,1),(23,1),(19,2),(19,3),(19,4),(20,4),(22,4),(23,4),(23,3),(23,2),
-            (1,7),(1,8),(1,9),(1,10),(2,10),(3,10),(4,10),(5,10),(5,9),(5,8),(5,7),(4,7),(2,7),
-            (13,7),(13,8),(13,9),(13,10),(14,10),(15,10),(16,10),(17,10),(17,9),(17,8),(17,7),(16,7),(14,7),
-            (1,13),(2,13),(3,13),(4,13),(5,13),(1,14),(1,15),(1,16),(2,16),(4,16),(5,16),(5,15),(5,14),
-            (7,13),(8,13),(9,13),(10,13),(11,13),(7,14),(7,15),(7,16),(8,16),(10,16),(11,16),(11,15),(11,14),
-            (13,13),(14,13),(15,13),(16,13),(17,13),(13,14),(13,15),(13,16),(14,16),(17,14),(17,15),(17,16),(16,16),
-            (1,19),(2,19),(4,19),(5,19),(1,20),(1,21),(1,22),(2,22),(3,22),(4,22),(5,22),(5,21),(5,20),
-            (7,19),(8,19),(4,19),(5,19),(7,20),(7,21),(7,22),(8,22),(9,22),(10,22),(11,22),(11,21),(11,20),(11,19),
-            (13,19),(14,19),(16,19),(17,19),(13,20),(13,21),(13,22),(14,22),(15,22),(16,22),(17,22),(17,21),(17,20),
-            (19,19),(20,19),(22,19),(23,19),(19,20),(19,21),(19,22),(20,22),(21,22),(22,22),(23,22),(23,21),(23,20),
-            (7,7),(7,8),(7,9),(7,10),(8,10),(9,10),(10,10),(11,10),(11,9),(11,8),(11,7),(10,7),(8,7),(10,19),
-        ],
-        'street_tiles': [
-            (11,5),(13,5),(14,5),(13,6),(14,6),(12,5),(15,5),(15,6),(16,5),(16,6),(17,5),(17,6),(18,5),
-            (8,6),(7,6),(6,6),(5,6),(4,6),(3,6),(2,6),(1,6),(20,9),(21,9),(21,14),(20,14),(19,14),(9,6),
-            (1,5),(2,5),(3,5),(4,5),(5,5),(22,11),(22,12),(19,18),(18,18),(17,18),(16,18),(15,18),(13,17),
-            (11,17),(10,17),(8,18),(7,18),(6,18),(5,18),(4,18),(3,18),(2,18),(1,18),(12,17),(18,6),
-        ],
-        'street_tiles_alt': [
-            (21,10),(21,11),(21,12),(21,13),(19,15),(19,16),
-        ],
-        'plants': [
-            (12,3),(12,4),(18,1),(18,2),(18,3),(18,4),(6,19),(6,20),(6,21),(18,19),
-        ],
-        'decorative_objects': [
-            {'pos': (1, 12), 'name': 'plant', 'img': '/images/tree.svg', 'size': 3},
-            {'pos': (21, 7), 'name': 'heli', 'img': '/images/helicopter.svg', 'size': 3, 'traversable': False},
-            {'pos': (21, 16), 'name': 'ambulance', 'img': '/images/ambulance.svg', 'size': 2.3, 'traversable': False},
-        ],
-        'keyboard_sign': (12, 0),
-        'area_signs': [
-            ((3,1), '01', 0.5), ((9,1), '02', 0.55), ((15,1), '03', 0.55), ((21,1), '04', 0.55),
-            ((3,10), '05', 0.55), ((9,10), '06', 0.55), ((15,10), '07', 0.55),
-            ((3,13), '08', 0.55), ((9,13), '09', 0.55), ((15,13), '10', 0.55),
-            ((3,22), '11', 0.45), ((9,22), '12', 0.55), ((15,22), '13', 0.55), ((21,22), '14', 0.55),
-        ],
-    }
-
     return WorldPreset(
         name='static',
         grid_width=25,
         grid_height=24,
         rooms=rooms,
         drop_zone=DropZoneDef((23, 8), 8),
-        ghost_victims=ghost_victims,
-        decorative_overrides=decorative_overrides,
+        ghost_victims=list(VICTIM_POOL),
+        decorative_overrides=_STATIC_DECORATIONS,
+        seed=seed,
+    )
+
+
+# ── Preset: mild_trees (mild victims only, fallen trees only) ─────────────────
+
+def preset_mild_trees(seed=None, **kwargs) -> WorldPreset:
+    """14-room world with 1–2 mildly injured victims per room and fallen trees
+    at 10/14 room entrances. No critically injured victims, no rocks."""
+    rng = random.Random(seed)
+    rooms = _build_14_rooms()
+
+    _MILD = [
+        ('mildly injured boy',         '/images/mildly injured boy.svg'),
+        ('mildly injured elderly man', '/images/mildly injured elderly man.svg'),
+        ('mildly injured woman',       '/images/mildly injured woman.svg'),
+        ('mildly injured cat',         '/images/mildly injured cat.svg'),
+    ]
+
+    for room in rooms:
+        interior = _interior_cells(room)
+        obs_dy = 1 if room.enter_direction == 'South' else -1
+        obs_potential = (room.door[0], room.door[1] + obs_dy)
+        available = [c for c in interior if c != room.door and c != obs_potential]
+        n_victims = rng.randint(1, 2)
+        used: set = set()
+        for _ in range(n_victims):
+            avail = [c for c in available if c not in used]
+            if not avail:
+                break
+            loc = rng.choice(avail)
+            used.add(loc)
+            name, img = rng.choice(_MILD)
+            room.victims.append(VictimDef(name=name, img=img,
+                                          location=loc, area=f'area {room.id}'))
+
+    room_indices = list(range(len(rooms)))
+    rng.shuffle(room_indices)
+    for room_idx in room_indices[:10]:
+        room = rooms[room_idx]
+        obs_dy = 1 if room.enter_direction == 'South' else -1
+        room.obstacles.append(ObstacleDef(
+            name='tree', img='/images/tree-fallen2.svg',
+            location=[room.door[0], room.door[1] + obs_dy],
+        ))
+
+    return WorldPreset(
+        name='mild_trees',
+        grid_width=25,
+        grid_height=24,
+        rooms=rooms,
+        drop_zone=DropZoneDef((23, 8), 8),
+        ghost_victims=list(VICTIM_POOL),
+        decorative_overrides=_STATIC_DECORATIONS,
         seed=seed,
     )
 
@@ -578,6 +616,7 @@ def preset_random(seed=None, num_rooms=4, num_victims=5, **kwargs) -> WorldPrese
 PRESET_REGISTRY = {
     'static': preset_static,
     'preset1': preset_static,
+    'mild_trees': preset_mild_trees,
     'preset2': preset_2_houses,
     'preset3': preset_2_big_houses,
     'random': preset_random,
