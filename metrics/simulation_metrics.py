@@ -252,10 +252,6 @@ class SimulationMetrics:
         sorted_timeline = sorted(victim_timeline.values(), key=lambda x: x['found_tick'])
         result['additional_suggested_metrics'] = {
             'per_victim_timeline': sorted_timeline,
-            'location_heatmaps': {
-                self._get_agent_id(a): self._get_tracker(a).location_trace
-                for a in agent_list if self._get_tracker(a)
-            },
             'time_to_first_victim_found': sorted_timeline[0]['found_tick'] if sorted_timeline else None,
         }
 

@@ -72,6 +72,38 @@ class BaseMemory:
             if isinstance(entry, dict) and entry.get('kind') in kinds
         ]
 
+    def compress(self, threshold: int = 10, keep_recent: int = 5) -> None:
+        """Collapse entries older than *keep_recent* into a single summary dict.
+
+        Called before injecting memory into LLM prompts so the window stays
+        compact even during long episodes.
+
+        Args:
+            threshold:   Minimum total entries before compression triggers.
+            keep_recent: Number of most-recent entries to preserve verbatim.
+        """
+        entries = list(self.storage)
+        if len(entries) <= threshold:
+            return
+        old, recent = entries[:-keep_recent], entries[-keep_recent:]
+        action_counts: dict = {}
+        notable = []
+        for e in old:
+            if not isinstance(e, dict):
+                continue
+            kind = e.get('kind') or e.get('entry_type') or e.get('action')
+            if kind:
+                action_counts[kind] = action_counts.get(kind, 0) + 1
+            if e.get('kind') in ('loop_warning', 'critic_feedback', 'planned_task'):
+                notable.append(e)
+        summary: dict = {'kind': 'summary', 'compressed': len(old), 'action_counts': action_counts}
+        if notable:
+            summary['notable'] = notable[-3:]
+        self.storage.clear()
+        self.storage.append(summary)
+        for e in recent:
+            self.storage.append(e)
+
     def __str__(self) -> str:
         """
         Returns a human-readable string representation of the memory.

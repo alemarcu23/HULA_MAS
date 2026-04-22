@@ -289,9 +289,11 @@ class LLMAgentBase(ArtificialBrain, Perception):
         self._handle_planner_messages(planner_msgs)
         self.communication.process_messages(peer_msgs)
 
-        # Record received messages for metrics
+        # Record received messages for metrics — exclude own broadcasts
         if self.metrics:
             for msg in peer_msgs:
+                if getattr(msg, 'from_id', '') == self.agent_id:
+                    continue
                 content = msg.content if hasattr(msg, 'content') else msg
                 if isinstance(content, dict):
                     self.metrics.record_message_received(

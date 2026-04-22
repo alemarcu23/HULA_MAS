@@ -37,6 +37,9 @@ from worlds1.environment_info import EnvironmentInformation
 
 logger = logging.getLogger('SearchRescueAgent')
 
+# How many ticks between proactive status broadcasts even if nothing changed.
+COMM_INTERVAL_TICKS = 15
+
 
 # ── Module-level helpers ────────────────────────────────────────────────────
 
@@ -138,7 +141,6 @@ class SearchRescueAgent(LLMAgentBase):
         self._pipeline_stage: PipelineStage = PipelineStage.IDLE
         self._pipeline_context: Dict[str, Any] = {}
         self._is_first_cycle: bool = True
-        self._last_action: Dict[str, Any] = {}
 
         # Cursor into CommunicationModule.all_messages_raw so we only save new
         # messages each tick without duplicating entries already in memory.
@@ -180,7 +182,6 @@ class SearchRescueAgent(LLMAgentBase):
         self._pipeline_stage = PipelineStage.IDLE
         self._pipeline_context = {}
         self._is_first_cycle = True
-        self._last_action = {}
         self._comm_msg_cursor = 0
         self._recent_actions.clear()
         self._last_critic_failure_critique = ''
@@ -189,6 +190,15 @@ class SearchRescueAgent(LLMAgentBase):
 
     def update_knowledge(self, filtered_state: State) -> None:
         super().update_knowledge(filtered_state)
+
+        # Remove rescued victims from the global belief so agents don't re-target them.
+        if self.shared_memory:
+            rescued_ids = {v['victim_id'] for v in (self.shared_memory.retrieve('rescued_victims') or [])}
+            if rescued_ids:
+                self.WORLD_STATE_GLOBAL['victims'] = [
+                    v for v in self.WORLD_STATE_GLOBAL.get('victims', [])
+                    if v.get('object_id') not in rescued_ids
+                ]
 
         # Normalize agent location to a strict (int, int) tuple.
         # MATRX may return a list or even float coords depending on the build;
@@ -355,7 +365,7 @@ class SearchRescueAgent(LLMAgentBase):
             'position': agent_info.get('location'),
             'carrying': agent_info.get('carrying'),
             'current_task': self._current_task,
-            'last_action': self._last_action,
+            'last_action': self._recent_actions[-1] if self._recent_actions else {},
             'critic_feedback': self._pipeline_context.get('critic_result'),
             'tick': self._tick_count,
         }
@@ -379,7 +389,7 @@ class SearchRescueAgent(LLMAgentBase):
         }
 
     def critic(self) -> Tuple[Optional[str], Dict]:
-        last_name = self._last_action.get('name')
+        last_name = (self._recent_actions[-1] if self._recent_actions else {}).get('name')
         if not last_name or last_name == 'Idle':
             self._pipeline_stage = PipelineStage.COMMUNICATION
             return self._advance_pipeline()
@@ -446,29 +456,46 @@ class SearchRescueAgent(LLMAgentBase):
             for s in area_summaries
         )
 
+        # Detect pending ask_help messages so the LLM knows to reply
+        pending_help = [
+            m for m in recent_msgs if m.get('message_type') == 'ask_help'
+        ]
+
         common_ctx = self._build_common_context()
         cap_text = common_ctx['agent_capabilities']
 
         system_prompt = (
-            'You are a coordination module for a Search and Rescue agent team. '
-            'Your job is to broadcast a short status update to your teammates '
-            'so they can avoid duplicate work and coordinate effectively.\n\n'
+            'You are a coordination module for a Search and Rescue agent team.\n\n'
             f'Your capabilities:\n{cap_text}\n\n'
-            'Respond with ONLY a JSON object:\n'
-            '{"message": "<your status update to teammates>"}\n\n'
-            'The message should briefly state: what you are currently doing, '
-            'where you are, what you plan to do next, and any discoveries '
-            '(victims, obstacles) worth sharing. Mention if you need help '
-            'due to capability limits (e.g. low medical). Keep it under 2 sentences.'
+            'Respond with ONLY a JSON object. There are two cases:\n\n'
+            '1. If a teammate sent an "ask_help" message AND you can assist '
+            '(you are idle or nearby), reply with:\n'
+            '   {"message": "<accept or explain why you cannot help>", '
+            '"message_type": "help", "send_to": "<agent_id>"}\n\n'
+            '2. Otherwise, broadcast a proactive status update:\n'
+            '   {"message": "<status>", "message_type": "message"}\n\n'
+            'Status messages should briefly state: what you are doing, where you are, '
+            'what you plan next, and any new discoveries. Keep it under 2 sentences.\n'
+            'For help replies: if you accept, say so and state your ETA or current position. '
+            'If you cannot help, say "Cannot help right now: <reason>".'
         )
+
+        pending_section = ''
+        if pending_help:
+            pending_lines = '\n'.join(
+                f"  - [{m['from']}] NEEDS HELP: {m['text']}"
+                for m in pending_help
+            )
+            pending_section = f'\n⚠ PENDING HELP REQUESTS (reply with message_type="help"):\n{pending_lines}\n'
 
         user_prompt = (
             f'Agent: {self.agent_id}\n'
             f'Current task: {self._current_task}\n'
             f'Position: {position}\n'
             f'Carrying: {carrying}\n'
-            f'Area exploration status:\n{area_status}\n\n'
-            f'Recent teammate messages:\n{teammate_msgs}'
+            f'Area exploration status:\n{area_status}\n'
+            f'{pending_section}'
+            f'\nRecent teammate messages:\n{teammate_msgs}'
         )
 
         return [
@@ -483,8 +510,9 @@ class SearchRescueAgent(LLMAgentBase):
         current_msg_count = len(self.communication.get_messages(limit=999, agent_busy=False))
         new_messages = current_msg_count > self._last_msg_count_at_comm
         task_changed = self._current_task != self._last_task_at_comm
+        periodic = (self._tick_count - self._last_comm_tick) >= COMM_INTERVAL_TICKS
 
-        if not critic_failed and not new_messages and not task_changed:
+        if not critic_failed and not new_messages and not task_changed and not periodic:
             self._pipeline_stage = PipelineStage.PLANNING
             return self._advance_pipeline()
 
@@ -514,13 +542,21 @@ class SearchRescueAgent(LLMAgentBase):
     def _handle_communication_result(self, result) -> Tuple[Optional[str], Dict]:
         text = getattr(result[0], 'content', '') or ''
 
-        # Try to parse JSON response
+        # Try to parse JSON response — LLM may return message_type and send_to
         message_text = None
+        message_type = 'message'
+        send_to = None  # None = broadcast
         parsed = _extract_action_json(text)
         if parsed and 'message' in parsed:
             message_text = parsed['message']
+            raw_type = parsed.get('message_type', 'message')
+            if raw_type in ('ask_help', 'help', 'message'):
+                message_type = raw_type
+            raw_to = parsed.get('send_to')
+            if raw_to and raw_to != 'all':
+                send_to = raw_to
         else:
-            # Fallback: use raw text as the message
+            # Fallback: use raw text as a generic broadcast
             message_text = text.strip()
 
         if message_text:
@@ -530,21 +566,24 @@ class SearchRescueAgent(LLMAgentBase):
             else:
                 self._recent_sent_msgs.append(message_text)
                 self.send_message(Message(
-                    content={'message_type': 'message', 'text': message_text},
+                    content={'message_type': message_type, 'text': message_text},
                     from_id=self.agent_id,
-                    to_id=None,  # broadcast to all
+                    to_id=send_to,
                 ))
                 self.memory.update('sent_message', {
                     'entry_type': 'sent_message',
                     'from': self.agent_id,
-                    'to': 'all',
-                    'message_type': 'message',
+                    'to': send_to or 'all',
+                    'message_type': message_type,
                     'text': message_text,
                     'tick': self._tick_count,
                 })
                 if self.metrics:
-                    self.metrics.record_message_sent(self._tick_count, 'all', 'message', message_text)
-                print(f'[{self.agent_id}] Coordination msg: {message_text[:120]}')
+                    self.metrics.record_message_sent(
+                        self._tick_count, send_to or 'all', message_type, message_text
+                    )
+                to_label = send_to or 'all'
+                print(f'[{self.agent_id}] Comm [{message_type}→{to_label}]: {message_text[:120]}')
         else:
             print(f'[{self.agent_id}] Communication stage produced empty message, skipping')
 
@@ -598,6 +637,7 @@ class SearchRescueAgent(LLMAgentBase):
     # ── REASONING stage ─────────────────────────────────────────────────
 
     def reason(self) -> Tuple[Optional[str], Dict]:
+        self.memory.compress()
         observation = dict(self.WORLD_STATE)
         global_state = self.WORLD_STATE_GLOBAL
         if any(global_state.get(k) for k in ('victims', 'obstacles', 'doors')):
@@ -767,7 +807,7 @@ class SearchRescueAgent(LLMAgentBase):
         # Validate
         check = self._validate_action(name, args)
         if check is not None:
-            self._last_action = {'name': name, 'args': args, 'result': 'validation_failed'}
+            self._recent_actions.append({'name': name, 'args': args, 'result': 'validation_failed'})
             self._pipeline_stage = PipelineStage.REASONING
             return check
 
@@ -796,7 +836,6 @@ class SearchRescueAgent(LLMAgentBase):
                         )
 
         self.memory.update('action', {'action': action_name, 'args': kwargs})
-        self._last_action = {'name': action_name, 'args': kwargs}
         self._recent_actions.append({'name': action_name, 'args': kwargs})
 
         if task_completing and task_completing != 'N/A':
