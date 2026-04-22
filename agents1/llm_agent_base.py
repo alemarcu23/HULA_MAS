@@ -151,6 +151,7 @@ class LLMAgentBase(ArtificialBrain, Perception):
         self._coop_carry_role: Optional[str] = None      # 'initiator' | 'partner' | None
         self._coop_carry_victim_id: Optional[str] = None
         self._coop_carry_partner_id: Optional[str] = None
+        self._coop_carry_cooldown: int = 0  # ticks to skip auto-enroll after partner timeout
 
         # ── Metrics ────────────────────────────────────────────────────────
         self.metrics: Optional[AgentMetricsTracker] = None  # initialized in initialize()
@@ -569,8 +570,12 @@ class LLMAgentBase(ArtificialBrain, Perception):
             return None
         rv = self.shared_memory.retrieve(SM_RENDEZVOUS)
 
+        # Decrement cooldown that suppresses re-enrollment after a partner timeout
+        if self._coop_carry_cooldown > 0:
+            self._coop_carry_cooldown -= 1
+
         # Auto-enroll as partner if SharedMemory names us (no LLM needed)
-        if rv and rv.get('partner') == self.agent_id and self._coop_carry_role is None:
+        if rv and rv.get('partner') == self.agent_id and self._coop_carry_role is None and self._coop_carry_cooldown == 0:
             self._coop_carry_role = 'partner'
             self._coop_carry_victim_id = rv['victim_id']
             self._coop_carry_partner_id = rv['initiator']
@@ -596,6 +601,15 @@ class LLMAgentBase(ArtificialBrain, Perception):
             print(f'[{self.agent_id}] Rendezvous timeout for victim {victim_id_log}')
             return self._idle('rendezvous_timeout')
 
+        # Partner timeout — initiator never reached victim within expected window
+        if (self._coop_carry_role == 'partner'
+                and self._tick_count - rv.get('tick_started', self._tick_count) > RENDEZVOUS_TIMEOUT_TICKS * 2):
+            victim_id_log = self._coop_carry_victim_id  # capture before clearing
+            self._coop_carry_role = self._coop_carry_victim_id = self._coop_carry_partner_id = None
+            self._coop_carry_cooldown = RENDEZVOUS_TIMEOUT_TICKS  # suppress immediate re-enrollment
+            print(f'[{self.agent_id}] Partner rendezvous timeout for victim {victim_id_log}')
+            return self._idle('partner_rendezvous_timeout')
+
         # Navigate to victim using existing A* infrastructure
         victim_loc = tuple(rv['victim_location'])
         dist = _chebyshev_distance(self.agent_location, victim_loc)
@@ -618,6 +632,16 @@ class LLMAgentBase(ArtificialBrain, Perception):
         # Partner waits until initiator is also adjacent
         if self._coop_carry_role == 'partner' and not rv.get('initiator_ready'):
             return self._idle('waiting_for_initiator')
+
+        # Safety guard: if victim is no longer in the world (already picked up by
+        # the other agent on this same tick), don't fire — MATRX would crash trying
+        # to index world_state[object_id] which returns None for inventory objects.
+        if (self.state_for_navigation is not None
+                and self.state_for_navigation.get(self._coop_carry_victim_id) is None):
+            # Victim gone from world — our partner grabbed it; clear rendezvous and
+            # let _handle_carry_autopilot() detect the SM_CARRY_AUTOPILOT signal.
+            self._coop_carry_role = self._coop_carry_victim_id = self._coop_carry_partner_id = None
+            return None
 
         # Both adjacent + initiator ready → fire CarryObjectTogether (pure code, no LLM)
         return _CarryObjectTogether.__name__, {

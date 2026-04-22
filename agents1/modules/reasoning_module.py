@@ -23,8 +23,17 @@ Joint action requirements:
 - Both you and your partner must be adjacent (Chebyshev distance ≤ 1) to the target before calling a cooperative action.
 - If no partner is adjacent, send an ask_help message via SendMessage and wait.
 
+Teammate capabilities — you do NOT know what your teammates can do:
+- You only know YOUR OWN capabilities (listed below under YOUR CAPABILITIES).
+- You do NOT know your teammate's strength, medical skill, or vision range.
+- If you need to coordinate on a task that depends on a teammate's capabilities (e.g. "can they carry this victim alone?"),
+  send them a message asking: "What are your capabilities?" before assuming they can or cannot help.
+- If a teammate asks about your capabilities, ALWAYS reply using SendMessage with a brief description
+  (e.g. "I can carry mildly injured victims alone and have medium vision.").
+- When you know a teammate's capabilities from a previous message, use that information to divide tasks efficiently.
+
 Messaging:
-- message_type="ask_help" to request assistance; "help" to respond; "message" for general updates.
+- message_type="ask_help" to request assistance; "help" to respond; "message" for general updates or capability sharing.
 """
 
 

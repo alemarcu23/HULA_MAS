@@ -70,6 +70,15 @@ Anti-self-assignment rule:
 - NEVER assign a cooperative task where the only named partner is yourself (agent_id).
 - Cooperative tasks (CarryObjectTogether, RemoveObjectTogether) must name a DIFFERENT agent as the partner.
 
+Teammate capabilities — you do NOT know what your teammates can do:
+- You only know YOUR OWN capabilities (see agent_capabilities field).
+- You do NOT know your teammate's vision range, strength, or medical skill.
+- Before assigning a cooperative task to a teammate, or before relying on them for a specific role,
+  you should ASK them about their capabilities via SendMessage.
+- Example: send a message like "What are your capabilities? Can you carry critically injured victims alone?"
+- If you have received a teammate's capability info in messages, use it to coordinate better.
+- If you need help with something you cannot do alone and don't know if your teammate can, ask first.
+
 Input fields reference:
 - agent_id: YOUR agent identifier — never assign cooperative tasks with yourself as partner
 - position: Your current [x, y] location
@@ -81,8 +90,8 @@ Input fields reference:
 - observed_objects: ALL objects ever discovered across the map
 - rescued_victims: Victims already delivered to the drop zone — do not re-rescue these
 - area_exploration: Coverage % per area — prioritize areas with lowest coverage
-- messages: Recent messages from teammates — respond to ask_help requests first
-- agent_capabilities: Your physical capabilities — only assign feasible tasks
+- messages: Recent messages from teammates — respond to ask_help requests first, and to capability questions
+- agent_capabilities: YOUR physical capabilities — only assign tasks feasible for you
 """
 
 _STOP_WORDS = frozenset({

@@ -236,38 +236,101 @@ def generate_area_signs(rooms: List[RoomDef]) -> List[Tuple[Tuple[int, int], int
     return signs
 
 
-# ── Preset: static (current hardcoded world) ─────────────────────────────────
+# ── Preset: static (14-room world with randomised victims and obstacles) ──────
 
 def preset_static(seed=None, **kwargs) -> WorldPreset:
-    """Reproduce the exact current hardcoded world layout."""
+    """14-room world with 1–2 random victims per room (≥5 critical) and
+    obstacles at 10/14 room entrances (≥4 big rocks). Seeded for reproducibility."""
+    rng = random.Random(seed)
+
     rooms = [
-        RoomDef(1, (1, 1), 5, 4, (3, 4), (3, 5), 'North'),
-        RoomDef(2, (7, 1), 5, 4, (9, 4), (9, 5), 'North'),
-        RoomDef(3, (13, 1), 5, 4, (15, 4), (15, 5), 'North'),
-        RoomDef(4, (19, 1), 5, 4, (21, 4), (21, 5), 'North'),
-        RoomDef(5, (1, 7), 5, 4, (3, 7), (3, 6), 'South'),
-        RoomDef(6, (7, 7), 5, 4, (9, 7), (9, 6), 'South'),
-        RoomDef(7, (13, 7), 5, 4, (15, 7), (15, 6), 'South'),
+        # Row 1 — North entry (door on bottom wall)
+        RoomDef(1,  (1,  1),  5, 4, (3,  4),  (3,  5),  'North'),
+        RoomDef(2,  (7,  1),  5, 4, (9,  4),  (9,  5),  'North'),
+        RoomDef(3,  (13, 1),  5, 4, (15, 4),  (15, 5),  'North'),
+        RoomDef(4,  (19, 1),  5, 4, (21, 4),  (21, 5),  'North'),
+        # Row 2 — South entry (door on top wall)
+        RoomDef(5,  (1,  7),  5, 4, (3,  7),  (3,  6),  'South'),
+        RoomDef(6,  (7,  7),  5, 4, (9,  7),  (9,  6),  'South'),
+        RoomDef(7,  (13, 7),  5, 4, (15, 7),  (15, 6),  'South'),
+        # Row 3 — North entry
+        RoomDef(8,  (1,  13), 5, 4, (3,  16), (3,  17), 'North'),
+        RoomDef(9,  (7,  13), 5, 4, (9,  16), (9,  17), 'North'),
+        RoomDef(10, (13, 13), 5, 4, (15, 16), (15, 17), 'North'),
+        # Row 4 — South entry
+        RoomDef(11, (1,  19), 5, 4, (3,  19), (3,  18), 'South'),
+        RoomDef(12, (7,  19), 5, 4, (9,  19), (9,  18), 'South'),
+        RoomDef(13, (13, 19), 5, 4, (15, 19), (15, 18), 'South'),
+        RoomDef(14, (19, 19), 5, 4, (21, 19), (21, 18), 'South'),
     ]
 
-    # Exact current victim placements
-    rooms[0].victims = [VictimDef('mildly injured boy', '/images/mildly injured boy.svg', (2, 2), 'area 1')]
-    rooms[1].victims = [VictimDef('critically injured girl', '/images/critically injured girl.svg', (10, 3), 'area 2')]
-    rooms[5].victims = [VictimDef('critically injured dog', '/images/critically injured dog.svg', (8, 9), 'area 6')]
-    rooms[6].victims = [VictimDef('mildly injured woman', '/images/mildly injured woman.svg', (14, 8), 'area 7')]
+    # ── Victim placement ──────────────────────────────────────────────────────
+    # Each room gets 1 or 2 victims at random non-overlapping interior cells.
+    # The potential obstacle cell (door_x, door_y-1) is excluded so victims
+    # never block the obstacle spawn point in North-entry rooms.
+    # Guarantee ≥5 critical: the first victim in each of rooms[0..4] is always
+    # drawn from CRITICAL; all other placements pick randomly between pools.
 
-    ghost_victims = [
-        ('critically injured girl', '/images/critically injured girl.svg'),
+    _CRITICAL = [
+        ('critically injured girl',          '/images/critically injured girl.svg'),
         ('critically injured elderly woman', '/images/critically injured elderly woman.svg'),
-        ('critically injured man', '/images/critically injured man.svg'),
-        ('critically injured dog', '/images/critically injured dog.svg'),
-        ('mildly injured boy', '/images/mildly injured boy.svg'),
+        ('critically injured man',           '/images/critically injured man.svg'),
+        ('critically injured dog',           '/images/critically injured dog.svg'),
+    ]
+    _MILD = [
+        ('mildly injured boy',         '/images/mildly injured boy.svg'),
         ('mildly injured elderly man', '/images/mildly injured elderly man.svg'),
-        ('mildly injured woman', '/images/mildly injured woman.svg'),
-        ('mildly injured cat', '/images/mildly injured cat.svg'),
+        ('mildly injured woman',       '/images/mildly injured woman.svg'),
+        ('mildly injured cat',         '/images/mildly injured cat.svg'),
     ]
 
-    # Exact current decorative object coordinates
+    for idx, room in enumerate(rooms):
+        interior = _interior_cells(room)
+        obs_potential = (room.door[0], room.door[1] - 1)
+        available = [c for c in interior if c != room.door and c != obs_potential]
+        n_victims = rng.randint(1, 2)
+        used: set = set()
+        for j in range(n_victims):
+            avail = [c for c in available if c not in used]
+            if not avail:
+                break
+            loc = rng.choice(avail)
+            used.add(loc)
+            pool = _CRITICAL if (idx < 5 and j == 0) else rng.choice([_CRITICAL, _MILD])
+            name, img = rng.choice(pool)
+            room.victims.append(VictimDef(name=name, img=img,
+                                          location=loc, area=f'area {room.id}'))
+
+    # ── Obstacle placement ────────────────────────────────────────────────────
+    # 10 of 14 rooms receive one obstacle at their door entrance.
+    # Exactly 4 rocks are guaranteed by building the type list before shuffling.
+
+    _OBS_NON_ROCK = [
+        ('stone', '/images/stone-small.svg'),
+        ('tree',  '/images/tree-fallen2.svg'),
+    ]
+    room_indices = list(range(len(rooms)))
+    rng.shuffle(room_indices)
+    obs_type_list = (
+        [('rock', '/images/stone.svg')] * 4 +
+        [rng.choice(_OBS_NON_ROCK) for _ in range(6)]
+    )
+    rng.shuffle(obs_type_list)
+    for i, room_idx in enumerate(room_indices[:10]):
+        room = rooms[room_idx]
+        obs_name, obs_img = obs_type_list[i]
+        room.obstacles.append(ObstacleDef(
+            name=obs_name, img=obs_img,
+            location=[room.door[0], room.door[1] - 1],
+        ))
+
+    # ── Ghost victims and drop zone ───────────────────────────────────────────
+    # One ghost block per actual victim so progress tracks full rescue.
+    # Grid expanded to 30×30; drop zone at x=28 (clear of all rooms ≤x=23).
+    ghost_victims = _collect_all_victims(rooms)
+    total_victims = len(ghost_victims)
+
+    # ── Decorative overrides (unchanged — covers all 14 rooms visually) ───────
     decorative_overrides = {
         'roof_tiles': [
             (1,1),(2,1),(3,1),(4,1),(5,1),(1,2),(1,3),(1,4),(2,4),(4,4),(5,4),(5,3),(5,2),(7,1),(8,1),(9,1),
@@ -313,13 +376,13 @@ def preset_static(seed=None, **kwargs) -> WorldPreset:
 
     return WorldPreset(
         name='static',
-        grid_width=25,
-        grid_height=24,
+        grid_width=30,
+        grid_height=30,
         rooms=rooms,
-        drop_zone=DropZoneDef((23, 8), 8),
+        drop_zone=DropZoneDef((28, 1), total_victims),
         ghost_victims=ghost_victims,
         decorative_overrides=decorative_overrides,
-        seed=None,
+        seed=seed,
     )
 
 

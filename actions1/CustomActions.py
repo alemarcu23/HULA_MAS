@@ -813,10 +813,17 @@ class CarryObjectTogether(Action):
         grab_range = 1 if 'grab_range' not in kwargs else kwargs['grab_range']
         max_objects = np.inf if 'max_objects' not in kwargs else kwargs['max_objects']
 
-        # Check calling agent is adjacent to the object
+        # Check calling agent is adjacent to the object.
+        # world_state[object_id] is None when the object is already in another
+        # agent's inventory (removed from the world grid) — treat as not-in-range
+        # so the action fails gracefully instead of crashing.
         if object_id:
+            obj_state = world_state[object_id]
+            if obj_state is None:
+                print("GrabObjectResult.NOT_IN_RANGE — object not in world (already carried).")
+                return GrabObjectResult(GrabObjectResult.NOT_IN_RANGE, False)
             agent_loc = world_state[agent_id]['location']
-            if get_distance(agent_loc, world_state[object_id]['location']) > grab_range:
+            if get_distance(agent_loc, obj_state['location']) > grab_range:
                 print("GrabObjectResult.NOT_IN_RANGE — agent not adjacent to object.")
                 return GrabObjectResult(GrabObjectResult.NOT_IN_RANGE, False)
 
