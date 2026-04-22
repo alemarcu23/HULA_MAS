@@ -1,6 +1,14 @@
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from helpers.object_types import _OBJECT_TYPES
+
+
+@dataclass
+class ValidationResult:
+    """Result of a pre-dispatch action validation."""
+    valid: bool
+    feedback: str = ''
 
 
 def _agent_location(ws: Dict) -> Optional[Tuple[int, int]]:
@@ -60,20 +68,27 @@ def _is_teammate_adjacent(
 def is_object_adjacent(
         args: Dict,
         ws: Dict,
-        allowed_types: set) -> Tuple[bool, str]:
-    """Validate if object_id is adjacent to agent."""
+        allowed_types: set) -> Optional['ValidationResult']:
+    """Validate if object_id is adjacent to agent.
+
+    Returns ``None`` when valid, or a ``ValidationResult`` with ``valid=False``
+    and a descriptive feedback message when the check fails.
+    """
     obj_id = args.get('object_id', '')
     summary = _adjacent_summary(ws, allowed_types)
     if not obj_id:
-        return False, f"This action requires an object_id but none was provided. 'Nearby objects: [{summary}]."
-        
+        return ValidationResult(False,
+            f"This action requires an object_id but none was provided. Nearby objects: [{summary}].")
+
     if obj_id not in summary:
-        return False, f"Object '{obj_id}' is not within reach. Move closer to the target or choose a different object. Nearby objects: [{summary}]."
-    
+        return ValidationResult(False,
+            f"Object '{obj_id}' is not within reach. Move closer to the target or choose a different object. Nearby objects: [{summary}].")
+
     obj = _find_object(obj_id, ws)
     if obj and obj.get('type') not in allowed_types:
         obj_type = obj.get('type', 'unknown')
-        return False, f"Object '{obj_id}' is a {obj_type}, not a valid target for this action. Nearby valid objects: [{summary}]."
+        return ValidationResult(False,
+            f"Object '{obj_id}' is a {obj_type}, not a valid target for this action. Nearby valid objects: [{summary}].")
 
 def _chebyshev_distance(a: Tuple[int, int], b: Tuple[int, int]) -> int:
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
@@ -135,7 +150,7 @@ def _get_adjacent(ws: Dict[str, Any]) -> List[Dict[str, Any]]:
     ):
         for obj in ws.get(group_name, []):
             for loc in _extract_locations(obj):
-                if _chebyshev_distance(agent_pos, loc) == 1:
+                if _chebyshev_distance(agent_pos, loc) <= 1:
                     enriched = dict(obj)
                     enriched.setdefault("type", obj_type)
                     enriched["location"] = loc

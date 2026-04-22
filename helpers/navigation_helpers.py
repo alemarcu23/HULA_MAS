@@ -89,6 +89,9 @@ def apply_navigation(
         # End at the door
         if area_meta.door:
             ordered.append(area_meta.door)
+        # Prepend door so agent navigates there first if not already adjacent
+        if area_meta.door:
+            ordered = [area_meta.door] + ordered
         if not ordered:
             return _IDLE_ACTION, state_updates
         navigator.reset_full()

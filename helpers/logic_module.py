@@ -21,16 +21,12 @@ Usage:
         ...
 """
 
-from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
-from helpers.logic_helpers import _find_object, _agent_location, _chebyshev_distance, is_object_adjacent, _get_carrying, _is_teammate_adjacent
+from helpers.logic_helpers import (
+    ValidationResult, _find_object, _agent_location, _chebyshev_distance,
+    is_object_adjacent, _get_carrying, _is_teammate_adjacent,
+)
 from helpers.object_types import _OBJECT_TYPES, _VICTIM_TYPES, _OBSTACLE_TYPES
-
-@dataclass
-class ValidationResult:
-    """Result of an agent-level action validation."""
-    valid: bool
-    feedback: str = ''
 
 
 _OK = ValidationResult(valid=True)
@@ -332,13 +328,11 @@ class ActionValidator:
         'MoveTo': _validate_move_to,
         'NavigateToDropZone': _validate_navigate_to_drop_zone,
         'MoveToArea': _validate_area_action,
-        'EnterArea': _validate_area_action,
         'SearchArea': _validate_search_area,
         'CarryObject': _validate_carry_object,
         'CarryObjectTogether': _validate_carry_object_together,
         'Drop': _validate_drop,
         'RemoveObject': _validate_remove_object,
         'RemoveObjectTogether': _validate_remove_object_together,
-        'Idle': _validate_idle,
         'SendMessage': _validate_send_message,
     }
