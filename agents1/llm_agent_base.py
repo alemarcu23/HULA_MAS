@@ -25,6 +25,7 @@ from matrx.agents.agent_utils.state_tracker import StateTracker
 from matrx.messages.message import Message
 
 from actions1.CustomActions import CarryObjectTogether as _CarryObjectTogether
+from actions1.CustomActions import RemoveObjectTogether as _RemoveObjectTogether
 from actions1.CustomActions import Idle as _Idle
 from matrx.actions.object_actions import DropObject as _DropObject
 
@@ -54,6 +55,7 @@ MIN_P: float = 0.0
 SM_CARRY_AUTOPILOT = 'carry_autopilot'
 SM_TASK_ASSIGNMENTS = 'current_task_assignments'
 SM_RENDEZVOUS = 'coop_rendezvous'
+SM_REMOVE_RENDEZVOUS = 'coop_remove_rendezvous'
 RENDEZVOUS_TIMEOUT_TICKS = 60
 
 # ── Base class ─────────────────────────────────────────────────────────────────
@@ -152,6 +154,11 @@ class LLMAgentBase(ArtificialBrain, Perception):
         self._coop_carry_victim_id: Optional[str] = None
         self._coop_carry_partner_id: Optional[str] = None
         self._coop_carry_cooldown: int = 0  # ticks to skip auto-enroll after partner timeout
+
+        # ── Cooperative remove rendezvous state machine ──────────────────────
+        self._coop_remove_role: Optional[str] = None     # 'initiator' | 'partner' | None
+        self._coop_remove_obj_id: Optional[str] = None
+        self._coop_remove_partner_id: Optional[str] = None
 
         # ── Metrics ────────────────────────────────────────────────────────
         self.metrics: Optional[AgentMetricsTracker] = None  # initialized in initialize()
@@ -370,10 +377,15 @@ class LLMAgentBase(ArtificialBrain, Perception):
         """Handle infrastructure concerns only (no LLM polling).
         """
         self._check_carry_success()
+        self._check_remove_success()
 
         rdv = self._handle_coop_carry_tick()
         if rdv is not None:
             return rdv
+
+        rdv_rem = self._handle_coop_remove_tick()
+        if rdv_rem is not None:
+            return rdv_rem
 
         autopilot = self._handle_carry_autopilot()
         if autopilot is not None:
@@ -647,6 +659,131 @@ class LLMAgentBase(ArtificialBrain, Perception):
         return _CarryObjectTogether.__name__, {
             'object_id': self._coop_carry_victim_id,
             'partner_name': self._coop_carry_partner_id,
+        }
+
+    # ── Cooperative remove rendezvous state machine ───────────────────────────
+
+    def _check_remove_success(self) -> None:
+        """Detect successful RemoveObjectTogether and clear rendezvous state."""
+        if self._coop_remove_role is None:
+            return
+        if (self.previous_action == _RemoveObjectTogether.__name__
+                and self.previous_action_result is not None
+                and self.previous_action_result.succeeded):
+            print(f'[{self.agent_id}] RemoveObjectTogether succeeded — clearing rendezvous')
+            if self.shared_memory:
+                self.shared_memory.update(SM_REMOVE_RENDEZVOUS, None)
+            self._coop_remove_role = self._coop_remove_obj_id = self._coop_remove_partner_id = None
+
+    def _setup_coop_remove_rendezvous(self, obj_id: str, partner_id: str) -> bool:
+        """Write a remove rendezvous entry to SharedMemory and enter initiator mode.
+
+        Called once when the LLM decides RemoveObjectTogether. After this,
+        all coordination is pure infrastructure — no further LLM calls until
+        the obstacle is removed.
+        """
+        if not self.shared_memory:
+            return False
+        obj_loc = None
+        for o in self.WORLD_STATE_GLOBAL.get('obstacles', []):
+            if o.get('object_id') == obj_id:
+                obj_loc = tuple(o['location'])
+                break
+        if obj_loc is None and self.state_for_navigation:
+            obj = self.state_for_navigation.get(obj_id)
+            if obj and isinstance(obj, dict):
+                obj_loc = tuple(obj['location'])
+        if obj_loc is None:
+            return False
+
+        existing = self.shared_memory.retrieve(SM_REMOVE_RENDEZVOUS)
+        if existing and existing.get('object_id') == obj_id:
+            return False  # rendezvous already active for this obstacle
+
+        self.shared_memory.update(SM_REMOVE_RENDEZVOUS, {
+            'initiator': self.agent_id,
+            'object_id': obj_id,
+            'object_location': obj_loc,
+            'partner': partner_id,
+            'initiator_ready': False,
+            'tick_started': self._tick_count,
+        })
+        self._coop_remove_role = 'initiator'
+        self._coop_remove_obj_id = obj_id
+        self._coop_remove_partner_id = partner_id
+        self._pending_future = None
+        print(f'[{self.agent_id}] Remove rendezvous: obj={obj_id} partner={partner_id}')
+        return True
+
+    def _handle_coop_remove_tick(self) -> Optional[Tuple[str, Dict]]:
+        """Per-tick rendezvous handler for RemoveObjectTogether.
+
+        Mirrors _handle_coop_carry_tick but for obstacle removal.
+        No autopilot after success — both agents resume LLM pipeline immediately.
+        """
+        if not self.shared_memory:
+            return None
+        rv = self.shared_memory.retrieve(SM_REMOVE_RENDEZVOUS)
+
+        # Auto-enroll as partner if SharedMemory names us
+        if rv and rv.get('partner') == self.agent_id and self._coop_remove_role is None:
+            self._coop_remove_role = 'partner'
+            self._coop_remove_obj_id = rv['object_id']
+            self._coop_remove_partner_id = rv['initiator']
+            self._pending_future = None
+            print(f'[{self.agent_id}] Auto-enrolled as remove partner for {rv["object_id"]}')
+
+        if self._coop_remove_role is None:
+            return None
+
+        # Rendezvous cleared externally (success or timeout)
+        if rv is None or rv.get('object_id') != self._coop_remove_obj_id:
+            self._coop_remove_role = self._coop_remove_obj_id = self._coop_remove_partner_id = None
+            return None
+
+        # Initiator timeout
+        if (self._coop_remove_role == 'initiator'
+                and self._tick_count - rv.get('tick_started', self._tick_count) > RENDEZVOUS_TIMEOUT_TICKS):
+            obj_id_log = self._coop_remove_obj_id
+            self.shared_memory.update(SM_REMOVE_RENDEZVOUS, None)
+            self._coop_remove_role = self._coop_remove_obj_id = self._coop_remove_partner_id = None
+            print(f'[{self.agent_id}] Remove rendezvous timeout for {obj_id_log}')
+            return self._idle('remove_rendezvous_timeout')
+
+        # Navigate to obstacle
+        obj_loc = tuple(rv['object_location'])
+        dist = _chebyshev_distance(self.agent_location, obj_loc)
+        if dist > 1:
+            if self._nav_target != obj_loc:
+                nav_target, action = navigate_to(obj_loc,
+                                                 navigator=self._navigator,
+                                                 state_tracker=self._state_tracker)
+                self._nav_target = nav_target
+                return action
+            return None  # navigation in progress
+
+        # Adjacent — mark initiator ready
+        if self._coop_remove_role == 'initiator' and not rv.get('initiator_ready'):
+            updated = dict(rv)
+            updated['initiator_ready'] = True
+            self.shared_memory.update(SM_REMOVE_RENDEZVOUS, updated)
+            print(f'[{self.agent_id}] Remove initiator adjacent, marked ready')
+
+        # Partner waits until initiator is also adjacent
+        if self._coop_remove_role == 'partner' and not rv.get('initiator_ready'):
+            return self._idle('waiting_for_remove_initiator')
+
+        # Safety: object already gone (removed by other agent this tick)
+        if (self.state_for_navigation is not None
+                and self.state_for_navigation.get(self._coop_remove_obj_id) is None):
+            self._coop_remove_role = self._coop_remove_obj_id = self._coop_remove_partner_id = None
+            return None
+
+        # Both adjacent + initiator ready → fire RemoveObjectTogether (pure code, no LLM)
+        return _RemoveObjectTogether.__name__, {
+            'object_id': self._coop_remove_obj_id,
+            'remove_range': 1,
+            'partner_name': self._coop_remove_partner_id,
         }
 
     def _validate_action(

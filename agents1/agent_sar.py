@@ -596,7 +596,8 @@ class SearchRescueAgent(LLMAgentBase):
         # Get raw messages for planner (messages flow into planning, not reasoning)
         agent_busy = (self._nav_target is not None
                       or self._carry_autopilot is not None
-                      or self._coop_carry_role is not None)
+                      or self._coop_carry_role is not None
+                      or self._coop_remove_role is not None)
         raw_messages = self.communication.get_messages(limit=10, agent_busy=agent_busy)
 
         state = self._build_canonical_state()
@@ -793,8 +794,8 @@ class SearchRescueAgent(LLMAgentBase):
                     f'planned task: {planned[:120]!r}'
                 )
 
-        # Intercept CarryObjectTogether BEFORE validation — the validator rejects
-        # the action when the partner isn't adjacent yet, but our rendezvous state
+        # Intercept cooperative actions BEFORE validation — the validator rejects
+        # them when the partner isn't adjacent yet, but the rendezvous state
         # machine handles navigation; validation is irrelevant here.
         if name == 'CarryObjectTogether':
             victim_id = args.get('object_id', '')
@@ -803,6 +804,14 @@ class SearchRescueAgent(LLMAgentBase):
                 self._pipeline_stage = PipelineStage.IDLE
                 return self._idle('rendezvous_initiated')
             # Setup failed (victim location unknown) — fall through to validate + dispatch
+
+        if name == 'RemoveObjectTogether':
+            obj_id = args.get('object_id', '')
+            partner_id = args.get('partner_id', '')
+            if obj_id and self._setup_coop_remove_rendezvous(obj_id, partner_id):
+                self._pipeline_stage = PipelineStage.IDLE
+                return self._idle('remove_rendezvous_initiated')
+            # Setup failed (object location unknown) — fall through to validate + dispatch
 
         # Validate
         check = self._validate_action(name, args)

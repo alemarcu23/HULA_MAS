@@ -17,7 +17,7 @@ if __name__ == "__main__":
     # ── Deployment ──────────────────────────────────────────────────────────────
     # hpc_mode=True:  headless HPC run (transformers backend, no GUI)
     # hpc_mode=False: local dev    (Ollama backend, browser GUI at localhost:3000)
-    hpc_mode   = False
+    hpc_mode   = True
     enable_gui = not hpc_mode
 
     # ── LLM / Model ─────────────────────────────────────────────────────────────
@@ -72,11 +72,12 @@ if __name__ == "__main__":
     vis_port = 3000  # browser visualizer
 
     # ── Logging ──────────────────────────────────────────────────────────────────
-    # SAR_LOG_DIR and SAR_EXPERIMENT_NAME env vars override these for HPC runs.
-    log_dir  = os.environ.get('SAR_LOG_DIR', os.path.join(fld, 'logs'))
-    exp_name = os.environ.get('SAR_EXPERIMENT_NAME', None)
-    if exp_name:
-        log_dir = os.path.join(log_dir, exp_name)
+    # Each run gets its own subdirectory so concurrent runs never overwrite each other.
+    # SAR_LOG_DIR overrides the base logs folder; SAR_EXPERIMENT_NAME sets the job label.
+    _log_base = os.environ.get('SAR_LOG_DIR', os.path.join(fld, 'logs'))
+    exp_name  = os.environ.get('SAR_EXPERIMENT_NAME', f"{agent_type}_{condition}")
+    _ts       = time.strftime('%Hh-%Mm-%Ss_date_%dd-%mm-%Yy')
+    log_dir   = os.path.join(_log_base, f"run_{exp_name}_at_time_{_ts}")
 
     # Scale LLM thread pool for the number of agents
     init_agent_pool(
@@ -122,6 +123,7 @@ if __name__ == "__main__":
             world_preset=world_preset, world_seed=world_seed,
             enable_gui=enable_gui,
             planner_config=planner_config, use_planner=use_planner,
+            score_file=score_file,
         )
 
         # Configure MATRX API port before startup

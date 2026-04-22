@@ -228,7 +228,7 @@ def create_builder(condition, name, folder, agent_type='baseline',
                    planning_mode='simple', agent_presets=None,
                    capability_knowledge='informed', comm_strategies=None,
                    world_preset='static', world_seed=None, enable_gui=True,
-                   planner_config=None, use_planner=True):
+                   planner_config=None, use_planner=True, score_file=None):
     # Set numpy's random generator
     np.random.seed(random_seed)
 
@@ -242,7 +242,9 @@ def create_builder(condition, name, folder, agent_type='baseline',
 
     # Create the collection goal with dynamic drop zone
     dz = preset.drop_zone
-    score_file = planner_config.get('score_file') if planner_config else None
+    # score_file priority: explicit arg > planner_config > default
+    if score_file is None:
+        score_file = planner_config.get('score_file') if planner_config else None
     goal = CollectionGoal(
         max_nr_ticks=np.inf,
         drop_zone_location=dz.location,
