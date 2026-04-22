@@ -34,7 +34,7 @@ class Perception:
             "obstacles": obstacles,
             "walls": walls,
             "teammates": [
-                {"id": t[0], "x": int(t[1][0]), "y": int(t[1][1])}
+                {"object_id": t[0], "x": int(t[1][0]), "y": int(t[1][1])}
                 for t in teammates
             ] if teammates else [],
         }
@@ -47,8 +47,8 @@ class Perception:
         (e.g. from ``SearchRescueAgent.initialize()``).
         """
         self.WORLD_STATE_GLOBAL: Dict[str, Any] = {
-            'victims':   [],   # [{'id', 'severity', 'location'}]
-            'obstacles': [],   # [{'id', 'type', 'location'}]
+            'victims':   [],   # [{'object_id', 'severity', 'location'}]
+            'obstacles': [],   # [{'object_id', 'type', 'location'}]
         }
 
     def update_world_belief(self, state) -> Dict[str, Any]:
@@ -105,10 +105,10 @@ class Perception:
                     severity = 'mild'
                 else:
                     severity = 'healthy'
-                existing = next((v for v in self.WORLD_STATE_GLOBAL['victims'] if v['id'] == obj_id), None)
+                existing = next((v for v in self.WORLD_STATE_GLOBAL['victims'] if v['object_id'] == obj_id), None)
                 if existing is None:
                     self.WORLD_STATE_GLOBAL['victims'].append(
-                        {'id': obj_id, 'severity': severity, 'location': pos}
+                        {'object_id': obj_id, 'severity': severity, 'location': pos}
                     )
                     print(
                         f'[Perception:{getattr(self, "agent_id", "?")}] '
@@ -120,10 +120,10 @@ class Perception:
 
             # --- Obstacles ---
             elif typ in ('rock', 'stone', 'tree'):
-                existing = next((o for o in self.WORLD_STATE_GLOBAL['obstacles'] if o['id'] == obj_id), None)
+                existing = next((o for o in self.WORLD_STATE_GLOBAL['obstacles'] if o['object_id'] == obj_id), None)
                 if existing is None:
                     self.WORLD_STATE_GLOBAL['obstacles'].append(
-                        {'id': obj_id, 'type': typ, 'location': pos}
+                        {'object_id': obj_id, 'type': typ, 'location': pos}
                     )
                     print(
                         f'[Perception:{getattr(self, "agent_id", "?")}] '

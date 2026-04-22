@@ -1,8 +1,8 @@
 from typing import Dict, List, Any
-from helpers.toon_utils import to_toon
+from helpers.toon_utils import to_toon, to_toon_sectioned
 
 
-CRITIC_PROMPT = """
+CRITIC_PROMPT_BASE = """
 You are an assistant that evaluates progress in a search and rescue mission.
 Assess whether the last action advanced the current subtask. Exceeding requirements counts as success.
 
@@ -10,67 +10,31 @@ When the action fails, your critique MUST be actionable: state what went wrong, 
 
 Special rule: A MoveTo where the target coordinates match the agent's current position is ALWAYS a no-op failure, even if the move technically executed. Mark it success=false with critique explaining the agent must choose a different destination.
 
-Input fields reference:
-- current_task: The subtask the agent was trying to complete
-- last_action: The action that was just executed (name + arguments)
-- observation.agent: Agent's current state — location, carrying
-- observation.victims: Victims currently visible near the agent
-- observation.obstacles: Obstacles currently visible near the agent
-- all_observations: Global discovered objects across the whole map
-
 Respond with valid JSON only:
 {"reasoning": "what happened and why", "success": true/false, "critique": "actionable next step if failed, empty string if succeeded"}
 
 Examples:
 
 INPUT:
-Position: [3,5], Carrying: mildly_injured_woman, Nearby: none
+Position: [3,5], Carrying: mildly_injured_woman
 Last action: CarryObject(object_id="mildly_injured_woman")
-Task: Pick up victim at location [3, 5]
+Task: Pick up mild victim at [3, 5]
 RESPONSE:
-{"reasoning": "At [3, 5], carrying the victim, no objects nearby. CarryObject succeeded.", "success": true, "critique": ""}
+{"reasoning": "At [3,5], now carrying victim. CarryObject succeeded.", "success": true, "critique": ""}
 
 INPUT:
-Position: [3,5], Carrying: None, Nearby: mildly_injured_woman [3, 7]
-Last action: CarryObject(object_id="mildly_injured_woman")
-Task: Pick up victim at location [3, 7]
-RESPONSE:
-{"reasoning": "You are not carrying the victim that you included int the CarryObject action.", "success": false, "critique": "You are too far away from the victim. Move closer"}
-
-INPUT:
-Position: [3,5], Carrying: None, Nearby: mildly_injured_woman
-Last action: CarryObject(object_id="mildly_injured_woman")
-Task: Pick up victim at location [3, 5]
-RESPONSE:
-{"reasoning": "Victim still on ground despite CarryObject attempt. Action failed.", "success": false, "critique": "CarryObject failed — check if this victim requires cooperative carry (CarryObjectTogether) due to severity. Retry or ask teammate for help."}
-
-INPUT:
-Position: [15,5], Carrying: None, Nearby: stone_1 at [15,4]
-Last action: RemoveObject(object_id="stone_1")
-Task: Remove obstacle blocking the door of Area 3
-RESPONSE:
-{"reasoning": "stone_1 still in nearby objects after RemoveObject — removal failed.", "success": false, "critique": "Solo removal failed. Try RemoveObjectTogether with a teammate, or check if you need to be adjacent to the object first."}
-
-INPUT:
-Position: [5,10], Carrying: None, Nearby: critically_injured_man at [5,10]
+Position: [5,10], Carrying: None, Nearby victims: critically_injured_man at [5,10]
 Last action: CarryObjectTogether(object_id="critically_injured_man")
-Task: Carry critical victim at [5, 10] to drop zone cooperatively
+Task: Carry critical victim cooperatively
 RESPONSE:
-{"reasoning": "CarryObjectTogether failed — no teammate adjacent. Critical victims need two agents.", "success": false, "critique": "Send ask_help message via SendMessage with victim ID and your location. Wait for teammate to arrive before retrying CarryObjectTogether."}
+{"reasoning": "CarryObjectTogether failed — check partner_id was provided and teammate is adjacent.", "success": false, "critique": "Ensure partner_id is set to a teammate object_id from observation.teammates, and both agents are adjacent to the victim before retrying."}
 
 INPUT:
-Position: [9,5], Carrying: None, Nearby: none
-Last action: MoveTo(x=9, y=4)
-Task: Explore Area 2
-RESPONSE:
-{"reasoning": "Agent moved to [9,5] but task is to explore Area 2. Movement happened but area exploration hasn't started yet — this is progress toward the task, not completion.", "success": false, "critique": "You are near Area 2 entrance at [9, 4]. Enter the area and search for victims inside."}
-
-INPUT:
-Position: [5,3], Carrying: None, Nearby: none
+Position: [5,3], Carrying: None
 Last action: MoveTo(x=5, y=3)
 Task: Navigate to victim at [8, 7]
 RESPONSE:
-{"reasoning": "MoveTo target (5, 3) is the agent's current position — this is a no-op. No movement occurred.", "success": false, "critique": "You tried to move to your own position. Choose a different destination closer to your target. Navigate toward [8, 7] instead."}
+{"reasoning": "MoveTo target (5,3) equals current position — no-op.", "success": false, "critique": "You moved to your own position. Choose a different destination toward [8, 7]."}
 """
 
 
@@ -83,6 +47,16 @@ class CriticBase:
         current_task = information.get('current_task', '')
         all_observations = information.get('all_observations', '')
         last_action = information.get('last_action', {})
+        game_rules = information.get('game_rules', '')
+        agent_capabilities = information.get('agent_capabilities', '')
+
+        # Inject game rules + capabilities into the system prompt so the critic
+        # can judge capability-specific failures (e.g. low-medical solo carry).
+        system_content = CRITIC_PROMPT_BASE
+        if game_rules:
+            system_content += f"\n\n{game_rules}"
+        if agent_capabilities:
+            system_content += f"\n\n== AGENT CAPABILITIES ==\n{agent_capabilities}"
 
         info_dict: Dict[str, Any] = {
             "current_task": current_task,
@@ -93,6 +67,6 @@ class CriticBase:
         print(to_toon(info_dict))
 
         return [
-            {"role": "system", "content": CRITIC_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user",   "content": to_toon(info_dict)},
         ]

@@ -4,7 +4,7 @@ Base memory module for agents.
 
 import json
 from collections import deque
-from typing import Any, List
+from typing import Any, List, Optional
 
 
 class BaseMemory:
@@ -19,14 +19,20 @@ class BaseMemory:
         """
         self.storage: deque = deque(maxlen=maxlen)
 
-    def update(self, key: str, information: Any) -> None:
-        """
-        Update memory with new information.
+    def update(self, key: str, information: Any, tick: Optional[int] = None) -> None:
+        """Update memory with new information.
 
         Args:
-            key (str): Only here to keep the signature consistent with SharedMemory.
-            information (Any): Information to store.
+            key:         Only here to keep the signature consistent with SharedMemory.
+            information: Information to store.
+            tick:        Current simulation tick. When provided and information is a
+                         dict without a 'tick' key, the tick is stamped into a copy
+                         of the dict before storing.
         """
+        # Stamp tick into dict entries that don't already have one
+        if tick is not None and isinstance(information, dict) and 'tick' not in information:
+            information = {**information, 'tick': tick}
+
         # Dedup: skip if information matches any of the last 3 entries
         recent = list(self.storage)[-3:]
         for last in recent:
@@ -47,13 +53,24 @@ class BaseMemory:
         return self.storage[-1] if self.storage else None
 
     def retrieve_all(self) -> List[Any]:
-        """
-        Retrieve all stored information.
+        """Retrieve all stored information."""
+        return list(self.storage)
+
+    def retrieve_by_type(self, kinds: List[str]) -> List[Any]:
+        """Retrieve only entries whose 'kind' field matches one of the given kinds.
+
+        Entries that are not dicts or that lack a 'kind' key are excluded.
+
+        Args:
+            kinds: List of kind strings to include, e.g. ['action', 'victim_found'].
 
         Returns:
-            List[Any]: All stored information.
+            Filtered list of matching entries in insertion order.
         """
-        return list(self.storage)
+        return [
+            entry for entry in self.storage
+            if isinstance(entry, dict) and entry.get('kind') in kinds
+        ]
 
     def __str__(self) -> str:
         """

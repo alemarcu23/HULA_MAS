@@ -53,6 +53,8 @@ MIN_P: float = 0.0
 # SharedMemory key templates
 SM_CARRY_AUTOPILOT = 'carry_autopilot'
 SM_TASK_ASSIGNMENTS = 'current_task_assignments'
+SM_RENDEZVOUS = 'coop_rendezvous'
+RENDEZVOUS_TIMEOUT_TICKS = 60
 
 # ── Base class ─────────────────────────────────────────────────────────────────
 
@@ -144,6 +146,11 @@ class LLMAgentBase(ArtificialBrain, Perception):
 
         # ── Cooperative carry autopilot ─────────────────────────────────────
         self._carry_autopilot: Optional[Dict] = None  # {'victim_id', 'destination', 'role'}
+
+        # ── Cooperative carry rendezvous state machine ───────────────────────
+        self._coop_carry_role: Optional[str] = None      # 'initiator' | 'partner' | None
+        self._coop_carry_victim_id: Optional[str] = None
+        self._coop_carry_partner_id: Optional[str] = None
 
         # ── Metrics ────────────────────────────────────────────────────────
         self.metrics: Optional[AgentMetricsTracker] = None  # initialized in initialize()
@@ -361,6 +368,10 @@ class LLMAgentBase(ArtificialBrain, Perception):
         """
         self._check_carry_success()
 
+        rdv = self._handle_coop_carry_tick()
+        if rdv is not None:
+            return rdv
+
         autopilot = self._handle_carry_autopilot()
         if autopilot is not None:
             return autopilot
@@ -399,6 +410,11 @@ class LLMAgentBase(ArtificialBrain, Perception):
                     'victim_id': obj_id,
                     'destination': dest,
                 })
+            # Carry succeeded — rendezvous complete, clear state
+            if self._coop_carry_role is not None:
+                if self.shared_memory:
+                    self.shared_memory.update(SM_RENDEZVOUS, None)
+                self._coop_carry_role = self._coop_carry_victim_id = self._coop_carry_partner_id = None
 
     def _handle_carry_autopilot(self) -> Optional[Tuple[str, Dict]]:
         """Handle autopilot navigation to drop zone after a cooperative carry.
@@ -496,7 +512,117 @@ class LLMAgentBase(ArtificialBrain, Perception):
         # Destination reached
         self._nav_target = None
         return None
-    
+
+    # ── Cooperative carry rendezvous state machine ────────────────────────────
+
+    def _setup_coop_carry_rendezvous(self, victim_id: str, partner_id: str) -> bool:
+        """Write a rendezvous entry to SharedMemory and enter initiator mode.
+
+        Called once when the LLM decides CarryObjectTogether. After this,
+        all coordination is pure infrastructure — no further LLM calls until
+        the victim is dropped.
+        """
+        if not self.shared_memory:
+            return False
+        # Find victim location for A* navigation
+        victim_loc = None
+        for v in self.WORLD_STATE_GLOBAL.get('victims', []):
+            if v.get('object_id', v.get('id')) == victim_id:
+                victim_loc = tuple(v['location'])
+                break
+        if victim_loc is None and self.state_for_navigation:
+            obj = self.state_for_navigation.get(victim_id)
+            if obj and isinstance(obj, dict):
+                victim_loc = tuple(obj['location'])
+        if victim_loc is None:
+            return False  # can't navigate without location
+
+        existing = self.shared_memory.retrieve(SM_RENDEZVOUS)
+        if existing and existing.get('victim_id') == victim_id:
+            return False  # rendezvous already active for this victim
+
+        self.shared_memory.update(SM_RENDEZVOUS, {
+            'initiator': self.agent_id,
+            'victim_id': victim_id,
+            'victim_location': victim_loc,
+            'partner': partner_id,
+            'initiator_ready': False,
+            'tick_started': self._tick_count,
+        })
+        self._coop_carry_role = 'initiator'
+        self._coop_carry_victim_id = victim_id
+        self._coop_carry_partner_id = partner_id
+        self._pending_future = None  # lock out LLM on initiator
+        print(f'[{self.agent_id}] Coop carry rendezvous: victim={victim_id} partner={partner_id}')
+        return True
+
+    def _handle_coop_carry_tick(self) -> Optional[Tuple[str, Dict]]:
+        """Per-tick rendezvous handler — runs for both initiator and partner.
+
+        Partner auto-enrolls by reading SharedMemory (no LLM, no message exchange).
+        Both agents navigate to the victim; once both are adjacent, both fire
+        CarryObjectTogether on the same tick so MATRX accepts the action.
+        """
+        if not self.shared_memory:
+            return None
+        rv = self.shared_memory.retrieve(SM_RENDEZVOUS)
+
+        # Auto-enroll as partner if SharedMemory names us (no LLM needed)
+        if rv and rv.get('partner') == self.agent_id and self._coop_carry_role is None:
+            self._coop_carry_role = 'partner'
+            self._coop_carry_victim_id = rv['victim_id']
+            self._coop_carry_partner_id = rv['initiator']
+            self._pending_future = None  # lock out LLM on partner
+            print(f'[{self.agent_id}] Auto-enrolled as partner for victim {rv["victim_id"]}')
+
+        if self._coop_carry_role is None:
+            return None
+
+        # Rendezvous cleared externally (carry success, timeout, victim rescued).
+        # Return None (not idle) so _handle_carry_autopilot() can run — the partner
+        # needs to reach the drop zone after the carrier writes SM_CARRY_AUTOPILOT.
+        if rv is None or rv.get('victim_id') != self._coop_carry_victim_id:
+            self._coop_carry_role = self._coop_carry_victim_id = self._coop_carry_partner_id = None
+            return None
+
+        # Initiator timeout safety
+        if (self._coop_carry_role == 'initiator'
+                and self._tick_count - rv.get('tick_started', self._tick_count) > RENDEZVOUS_TIMEOUT_TICKS):
+            victim_id_log = self._coop_carry_victim_id  # capture before clearing
+            self.shared_memory.update(SM_RENDEZVOUS, None)
+            self._coop_carry_role = self._coop_carry_victim_id = self._coop_carry_partner_id = None
+            print(f'[{self.agent_id}] Rendezvous timeout for victim {victim_id_log}')
+            return self._idle('rendezvous_timeout')
+
+        # Navigate to victim using existing A* infrastructure
+        victim_loc = tuple(rv['victim_location'])
+        dist = _chebyshev_distance(self.agent_location, victim_loc)
+        if dist > 1:
+            if self._nav_target != victim_loc:
+                nav_target, action = navigate_to(victim_loc,
+                                                 navigator=self._navigator,
+                                                 state_tracker=self._state_tracker)
+                self._nav_target = nav_target
+                return action
+            return None  # navigation in progress — _handle_navigation_tick handles moves
+
+        # Adjacent to victim
+        if self._coop_carry_role == 'initiator' and not rv.get('initiator_ready'):
+            updated = dict(rv)
+            updated['initiator_ready'] = True
+            self.shared_memory.update(SM_RENDEZVOUS, updated)
+            print(f'[{self.agent_id}] Initiator adjacent, marked ready — waiting for partner')
+
+        # Partner waits until initiator is also adjacent
+        if self._coop_carry_role == 'partner' and not rv.get('initiator_ready'):
+            return self._idle('waiting_for_initiator')
+
+        # Both adjacent + initiator ready → fire CarryObjectTogether (pure code, no LLM)
+        return _CarryObjectTogether.__name__, {
+            'object_id': self._coop_carry_victim_id,
+            'partner_name': self._coop_carry_partner_id,
+        }
+
     def _validate_action(
         self, name: str, args: Dict[str, Any]
     ) -> Optional[Tuple[str, Dict]]:
@@ -517,14 +643,21 @@ class LLMAgentBase(ArtificialBrain, Perception):
         messages: List[Dict],
         tools: Optional[List] = None,
         tool_choice: str = 'auto',
+        max_tokens: Optional[int] = None,
     ) -> None:
-        """Submit an async LLM call."""
+        """Submit an async LLM call.
+
+        Args:
+            max_tokens: Override the default MAX_NR_TOKENS for this call.
+                        Useful for short-answer stages (e.g. communication)
+                        where a lower cap enforces brevity.
+        """
         if self.metrics:
             self.metrics.record_llm_call_start()
         self._pending_future = submit_llm_call(
             llm_model=self._llm_model,
             messages=messages,
-            max_token_num=MAX_NR_TOKENS,
+            max_token_num=max_tokens if max_tokens is not None else MAX_NR_TOKENS,
             temperature=TEMPERATURE,
             top_p=TOP_P,
             top_k=TOP_K,

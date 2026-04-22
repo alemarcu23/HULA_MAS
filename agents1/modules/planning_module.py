@@ -6,6 +6,12 @@ from enum import Enum
 from typing import Dict, List, Any, Optional
 from helpers.toon_utils import to_toon
 
+try:
+    from engine.parsing_utils import load_few_shot
+except ImportError:
+    def load_few_shot(key):
+        return []
+
 logger = logging.getLogger('Planning')
 
 TASK_DECOMPOSITION_PROMPT = """
@@ -14,13 +20,20 @@ Break the given task into 3-7 atomic subtasks. Each subtask must be verifiable a
 
 Include target IDs and coordinates from the observed objects when available.
 
+DAG conditional syntax (use when outcome is uncertain):
+- Write subtasks as numbered steps.
+- To add a conditional branch, end the step with ". If <condition>, <alternative action>."
+  Example: "3. Remove stone_1 blocking the door. If stone_1 requires cooperative removal, send ask_help to teammate."
+- The TaskGraph parser will split conditional text into a node + condition_action.
+
 Respond with ONLY a numbered list, one subtask per line. No explanations or preamble.
 Example:
-1. Navigate to area 1 entrance at [3, 4]
-2. Remove stone_1 blocking the door
-3. Search area 1 for victims
-4. Carry mildly_injured_woman to drop zone
-
+1. Navigate to area 1 entrance at [3, 4].
+2. Remove any obstacle blocking the door. If obstacle is a big rock, send ask_help and wait for teammate.
+3. Search area 1 for victims.
+4. Carry mildly_injured_woman to drop zone.
+5. Navigate to drop zone.
+6. Drop the victim at the drop zone.
 """
 
 PLANNER_PROMPT = """
@@ -28,35 +41,13 @@ You are the task planner for a search-and-rescue agent.
 
 Your job is to output the single best NEXT task for this agent only.
 The overall mission is to rescue all victims from all areas and deliver them to the drop zone.
-You have certain physical capabilities that restrict what tasks you can perform, and you should use the information available to you to choose an appropriate task that makes progress towards the overall mission.
-
-Feedback from the critique is provided to help you determine if the last action made progress on the current task, and to adjust future tasks accordingly.
-Memory of past actions and observations is also available to help you avoid repeating failed actions or suggesting impossible tasks.
 
 Rules:
 - Output exactly ONE single-sentence task.
 - The task must be immediately actionable by this agent.
 - Do NOT output explanations, reasoning, lists, or multiple options.
-- Do NOT assign tasks that are:
-  - already completed,
-  - currently being executed by this agent OR by another agent
-  - impossible with the current known information.
+- Do NOT assign tasks that are already completed or currently being executed by another agent.
 - Include object IDs, agent IDs, area names, and [x, y] coordinates whenever known.
-
-Coordination rules:
-- If a teammate message includes an ask_help request for a cooperative action, prioritize helping that teammate.
-- Critical victims and large rocks require cooperation.
-- CarryObjectTogether and RemoveObjectTogether can only be executed if both agents are adjacent to the target and within 1 block of each other.
-- If this agent is the one initiating a cooperative action:
-  - first send an ask_help message,
-  - then stay near the target and wait (Idle) for the teammate,
-  - then perform the cooperative action when the teammate is adjacent.
-- If this agent is responding to a help request:
-  - navigate to the teammate or target location,
-  - become adjacent,
-  - then perform the cooperative action.
-- If already adjacent and all conditions are satisfied, output the cooperative action task directly.
-- After a successful cooperative carry, both agents are automatically moved to the drop zone.
 
 Output style:
 - Return exactly one sentence.
@@ -68,16 +59,12 @@ Good examples:
 - "Pick up victim_1 at [2, 5] alone."
 - "Send ask_help for victim_3 at [8, 6] and wait adjacent to it."
 - "Remove the rock blocking Area 2 at [4, 7]."
-- "Explore to Area 1."
-- "Idle at [8, 6] and wait for rescuebot1 to arrive for cooperative carry of victim_3."
+- "Explore Area 1."
 
 Bad outputs:
 - "I think the best plan is to first explore and then maybe rescue someone."
 - "Help teammate, or explore Area 2 if that fails."
 - "The next action depends on what the other agents do."
-- "Search the closest area for victims and rescue them."
-
-Return only the single best next task using all information available.
 
 Anti-self-assignment rule:
 - NEVER assign a cooperative task where the only named partner is yourself (agent_id).
@@ -87,14 +74,15 @@ Input fields reference:
 - agent_id: YOUR agent identifier — never assign cooperative tasks with yourself as partner
 - position: Your current [x, y] location
 - current_task: The high-level mission task assigned to you
-- critic_feedback: Whether your last action succeeded or failed, with reason — if failed, adjust the task
+- game_rules: Official rules for carrying victims and removing obstacles — always follow these
+- critic_feedback: Whether your last action succeeded or failed — if failed, adjust the task
 - previous_tasks: Your recent task history — avoid repeating failed tasks
 - nearby_objects: Victims and obstacles within your vision range
 - observed_objects: ALL objects ever discovered across the map
 - rescued_victims: Victims already delivered to the drop zone — do not re-rescue these
 - area_exploration: Coverage % per area — prioritize areas with lowest coverage
-- messages: Recent messages from teammates (help requests, status updates) — respond to ask_help first
-- agent_capabilities: Your physical capabilities (vision, strength, medical, speed) — only assign feasible tasks
+- messages: Recent messages from teammates — respond to ask_help requests first
+- agent_capabilities: Your physical capabilities — only assign feasible tasks
 """
 
 _STOP_WORDS = frozenset({
@@ -125,11 +113,28 @@ class Planning:
             self.task_graph = TaskGraph.from_task_list(decomposition)
                 
     def get_planning_prompt(self, information: Dict[str, Any]) -> List[Dict[str, str]]:
-        print("Generating planning prompt with information:", json.dumps(information, indent=2))
-        return [
-            {"role": "system", "content": PLANNER_PROMPT},
-            {"role": "user",   "content": to_toon(information)},
-        ]
+        print("Generating planning prompt with information:", json.dumps(information, indent=2, default=str))
+
+        # Inject capability-aware game rules into the system prompt
+        game_rules = information.get('game_rules', '')
+        system_content = PLANNER_PROMPT
+        if game_rules:
+            system_content = f"{PLANNER_PROMPT}\n\n{game_rules}"
+
+        messages = [{"role": "system", "content": system_content}]
+
+        # Load few-shot examples for next-task planning
+        try:
+            examples = load_few_shot('planning_next_task')
+            for ex in examples:
+                if 'user' in ex and 'assistant' in ex:
+                    messages.append({"role": "user", "content": ex['user'].strip()})
+                    messages.append({"role": "assistant", "content": ex['assistant'].strip()})
+        except Exception:
+            pass
+
+        messages.append({"role": "user", "content": to_toon(information)})
+        return messages
 
     def get_task_decomposition_prompt(
         self, information: Dict[str, Any]

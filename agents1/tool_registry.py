@@ -1,15 +1,17 @@
 """
 Tool registry: @tool-decorated MATRX action functions, reasoning strategy
-prompts, game rules, and a schema-builder helper.
+prompts, and a schema-builder helper.
 
 All 13 LangChain @tool functions live here so search_rescue_agent.py stays
 focused on tick-loop orchestration.  Each tool returns a plain
 (action_name, args_dict) tuple — the actual MATRX dispatch and partner_name
 enrichment happen in action_dispatch.py at runtime.
 
+Game rules are the single source of truth in agents1.capabilities.get_game_rules().
+
 Usage:
     from agents1.tool_registry import (
-        ALL_ACTION_TOOLS, REASONING_STRATEGIES, GAME_RULES,
+        ALL_ACTION_TOOLS, REASONING_STRATEGIES,
         build_tool_schemas,
     )
 """
@@ -40,22 +42,7 @@ REASONING_STRATEGIES: Dict[str, str] = {
     ),
 }
 
-def get_game_rules_str(drop_zone=(23, 8)):
-    """Static fallback game rules. For capability-aware rules, use agents1.capabilities.get_game_rules()."""
-    dz = drop_zone
-    return (
-        "Rules:\n"
-        f"- Critically injured victims require CarryObjectTogether (both agents).\n"
-        "- Big rocks require RemoveObjectTogether (both agents).\n"
-        "- Trees can only be removed by the rescue robot (RemoveObject).\n"
-        "- Small stones can be removed solo (RemoveObject).\n"
-        f"- Deliver rescued victims to the drop zone at {dz}.\n"
-        "- You can only carry one victim at a time."
-    )
-
-
-# Static fallback (backward compatibility)
-GAME_RULES = get_game_rules_str()
+# Game rules: single source of truth in agents1.capabilities.get_game_rules()
 
 # ── Action tools ──────────────────────────────────────────────────────────────
 # Defined at module level so they don't shadow the aliased MATRX action-class
@@ -113,64 +100,76 @@ def MoveToArea(area: int, task_completing: str):
 
 @tool
 def NavigateToDropZone(task_completing: str = "navigating to drop zone"):
-    """Navigate to the rescue drop zone to deliver a carried victim."""
+    """Navigate to the rescue drop zone to deliver a carried victim.
+    Use this after CarryObject or CarryObjectTogether; follow with Drop to score points."""
     return 'NavigateToDropZone', {'task_completing': task_completing}
 
 
 @tool
 def CarryObject(object_id: str, task_completing: str = "carrying victim"):
-    """Pick up and carry a mildly injured victim or small item. Must be adjacent (distance ≤ 1).
+    """Pick up and carry a victim solo. Only valid if your medical capability allows it.
+    - medical=high: can carry ALL victims (mild and critical) alone.
+    - medical=medium: can carry MILDLY injured victims alone; critical requires CarryObjectTogether.
+    - medical=low: CANNOT carry any victim alone; always use CarryObjectTogether.
+    You must be adjacent (Chebyshev distance ≤ 1) to the victim. After picking up, use
+    NavigateToDropZone then Drop to score points.
 
     Args:
-        object_id: The ID of the object to carry (from nearby observations).
-        task_completing: A brief description of the subtask this action will complete
-                        (e.g. "approaching victim to carry" or "navigating to drop zone").
+        object_id: The ID of the victim to carry (from observation.nearby_victims).
+        task_completing: Brief description of the subtask this action completes.
     """
     return 'CarryObject', {'object_id': object_id}, {'task_completing': task_completing}
 
 
 @tool
 def CarryObjectTogether(object_id: str, partner_id: str, task_completing: str = "carrying victim cooperatively"):
-    """Cooperatively carry a critically injured victim or big rock with a partner agent.
-    Both agents must be adjacent to the object.
+    """Cooperatively carry a critically injured victim with a partner agent.
+    Required when your medical capability is low, or when carrying a critical victim regardless of capability.
+    BOTH agents must be adjacent (Chebyshev distance ≤ 1) to the victim before calling this.
+    After picking up, BOTH agents must call NavigateToDropZone then DropObjectTogether to score points.
 
     Args:
-        object_id: The ID of the object to carry cooperatively.
-        partner_id: The ID of the adjacent teammate to cooperate with (from the 'teammates' list).
-        task_completing: A brief description of the subtask this action will complete
-                        (e.g. "approaching victim to carry" or "navigating to drop zone").
+        object_id: The ID of the victim to carry cooperatively (from observation.nearby_victims).
+        partner_id: REQUIRED — the object_id of the adjacent teammate from observation.teammates.
+        task_completing: Brief description of the subtask this action completes.
     """
     return 'CarryObjectTogether', {'object_id': object_id, 'partner_id': partner_id}, {'task_completing': task_completing}
 
 
 @tool
 def Drop():
-    """Drop the currently carried object at the current grid position."""
+    """Drop the currently carried object at the current grid position.
+    Use this at the drop zone after NavigateToDropZone to score rescue points."""
     return 'Drop', {}, {'task_completing': "dropping carried victim"}
+
 
 @tool
 def RemoveObject(object_id: str, task_completing: str = "removing obstacle"):
-    """Remove a small stone or tree obstacle from the grid. Must be adjacent (distance ≤ 1).
-    Note: only the rescue robot can remove trees; either agent can remove small stones.
+    """Remove a small stone or fallen tree obstacle solo. Capability constraints apply:
+    - strength=high: can remove trees, stones, and rocks alone.
+    - strength=medium: can remove trees and small stones alone; big rocks require RemoveObjectTogether.
+    - strength=low: can only remove fallen trees alone; stones and rocks require RemoveObjectTogether.
+    Note: ONLY the rescue robot (RescueBot) can remove trees; human agents cannot.
+    You must be adjacent (Chebyshev distance ≤ 1) to the obstacle.
+    Big grey rocks ALWAYS require RemoveObjectTogether regardless of strength.
 
     Args:
-        object_id: The ID of the obstacle to remove.
-        task_completing: A brief description of the subtask this action will complete
-                        (e.g. "approaching victim to carry" or "navigating to drop zone").
+        object_id: The ID of the obstacle to remove (from observation.nearby_obstacles).
+        task_completing: Brief description of the subtask this action completes.
     """
     return 'RemoveObject', {'object_id': object_id}, {'task_completing': task_completing}
 
 
 @tool
 def RemoveObjectTogether(object_id: str, partner_id: str, task_completing: str = "removing obstacle cooperatively"):
-    """Cooperatively remove a big rock obstacle with a partner agent.
-    Both agents must be adjacent to the rock.
+    """Cooperatively remove a big grey rock obstacle with a partner agent.
+    Big rocks ALWAYS require both agents — solo removal is never possible regardless of strength.
+    BOTH agents must be adjacent (Chebyshev distance ≤ 1) to the rock before calling this.
 
     Args:
-        object_id: The ID of the rock obstacle to remove cooperatively.
-        partner_id: The ID of the adjacent teammate to cooperate with (from the 'teammates' list).
-        task_completing: A brief description of the subtask this action will complete
-                        (e.g. "approaching victim to carry" or "navigating to drop zone").
+        object_id: The ID of the rock to remove cooperatively (from observation.nearby_obstacles).
+        partner_id: REQUIRED — the object_id of the adjacent teammate from observation.teammates.
+        task_completing: Brief description of the subtask this action completes.
     """
     return 'RemoveObjectTogether', {'object_id': object_id, 'partner_id': partner_id}, {'task_completing': task_completing}
 
@@ -190,11 +189,15 @@ def SearchArea(area: int, task_completing: str = "searching area"):
 @tool
 def SendMessage(message: str, send_to: str, message_type: str = "message"):
     """Send a message to one or all teammates. This uses your action for this tick.
+    Use sparingly — keep messages to 1-2 sentences.
 
     Args:
-        message: The message content to send.
-        send_to: Agent name for directed message, or "all" for broadcast.
-        message_type: One of: ask_help (expects reply), help (response to ask_help), message (general).
+        message: The message content to send (1-2 sentences max).
+        send_to: Agent name for a directed message, or "all" for a broadcast.
+        message_type: One of:
+            - "ask_help": request assistance (partner is expected to reply with "help").
+            - "help": respond to an ask_help request from a teammate.
+            - "message": general status update or information sharing.
     """
     return 'SendMessage', {'message': message, 'send_to': send_to,
         'message_type': message_type}, {'task_completing': f"sending {message_type} message"}

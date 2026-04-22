@@ -10,7 +10,14 @@ Each agent has 4 capability dimensions:
 The environment enforces these via is_possible() checks and action_duration.
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# Short note injected instead of full capability text when capability_knowledge='discovery'
+DISCOVERY_NOTE = (
+    "You do not yet know your exact capability limits. "
+    "Attempt tasks; if you fail, the critic will tell you why and you should adjust accordingly."
+)
 
 
 # ── Presets ──────────────────────────────────────────────────────────────────
@@ -141,52 +148,90 @@ def get_capability_prompt(capabilities: Dict[str, Any]) -> str:
 
     return '\n'.join(lines)
 
-def filter_tools_for_capabilities(
-    tool_schemas: List[Dict],
-    tools_by_name: Dict[str, Any],
-    capabilities: Dict[str, Any],
-) -> Tuple[Dict[str, Any], List[Dict]]:
-    """Remove tools the agent can NEVER use based on capabilities.
+def get_game_rules(drop_zone=(23, 8), capabilities: Optional[Dict[str, Any]] = None) -> str:
+    """Return game rules, optionally with capability-specific carrying/removal lines.
 
-    Returns filtered (tools_by_name, tool_schemas).
+    Args:
+        drop_zone: (x, y) coordinates of the rescue drop zone.
+        capabilities: Agent capability dict (vision/strength/medical/speed). When
+            provided, replaces the generic 'check your capabilities' note with
+            concrete rules derived from the agent's actual profile.
     """
-    remove_names = set()
-
-    # Joint/cooperative actions (CarryObjectTogether, RemoveObjectTogether) are
-    # never filtered — they always succeed regardless of individual capability.
-
-    filtered_tools_by_name = {
-        k: v for k, v in tools_by_name.items() if k not in remove_names
-    }
-    filtered_schemas = [
-        s for s in tool_schemas
-        if s.get('function', {}).get('name', s.get('name', '')) not in remove_names
-    ]
-
-    return filtered_tools_by_name, filtered_schemas
-
-def get_game_rules(drop_zone=(23, 8)) -> str:
     dz = drop_zone
-    base_rules = [
-        "Goal:",
-        f"- Search all areas for victims and rescue them by carrying them to the drop zone at {dz} and using Drop.",
-        "- You can only carry one victim at a time.",
-        "",
-        "Carrying victims:",
-        "- Mildly injured victim: use CarryObject (solo) if your medical capability allows, then NavigateToDropZone, then Drop.",
-        "- Critically injured victim: use CarryObjectTogether with a partner (both must be adjacent to the victim first).",
-        "- After carrying, always navigate to the drop zone and Drop the victim there to score points.",
-        "",
-        "Removing obstacles:",
-        "- Small stone: use RemoveObject (solo). You must be adjacent (distance ≤ 1).",
-        "- Fallen tree: use RemoveObject (solo, rescue robot only).",
-        "- Big grey rock: use RemoveObjectTogether with a partner (both must be adjacent).",
-        "- Remove obstacles that are blocking your path to victims or areas.",
-        "",
-        "Navigation:",
-        "- Use MoveTo(x, y) or MoveToArea(area) to navigate. You must be adjacent to an object to interact with it.",
-        "- Use EnterArea(area) when you are at the door of an area to enter it.",
-        "- Use SearchArea(area) to systematically cover all cells in an area.",
-    ]
+
+    # --- Carrying rules ---
+    if capabilities is None:
+        carry_lines = [
+            "- Mildly injured victim: use CarryObject (solo) if your medical capability allows, then NavigateToDropZone, then Drop.",
+            "- Critically injured victim: always use CarryObjectTogether with a partner (both must be adjacent to the victim first).",
+        ]
+    else:
+        medical = capabilities.get('medical', 'low')
+        if medical == 'high':
+            carry_lines = [
+                "- You can carry ALL victims alone: use CarryObject, then NavigateToDropZone, then Drop.",
+                "- Critically injured victims STILL score more points when carried cooperatively, but you may do it solo.",
+            ]
+        elif medical == 'medium':
+            carry_lines = [
+                "- Mildly injured victim: use CarryObject (solo), then NavigateToDropZone, then Drop.",
+                "- Critically injured victim: you CANNOT carry these alone — use CarryObjectTogether with an adjacent partner.",
+            ]
+        else:  # low
+            carry_lines = [
+                "- Your medical level is LOW: you CANNOT carry any victim alone.",
+                "- ALL victims require CarryObjectTogether with an adjacent partner (partner_id REQUIRED).",
+            ]
+
+    # --- Removal rules ---
+    if capabilities is None:
+        removal_lines = [
+            "- Small stone: use RemoveObject (solo). You must be adjacent (distance ≤ 1).",
+            "- Fallen tree: use RemoveObject (solo, rescue robot only).",
+            "- Big grey rock: ALWAYS use RemoveObjectTogether with a partner (both must be adjacent).",
+        ]
+    else:
+        strength = capabilities.get('strength', 'low')
+        if strength == 'high':
+            removal_lines = [
+                "- You can remove trees, small stones, and big grey rocks alone (RemoveObject).",
+                "- You must be adjacent (distance ≤ 1) to the obstacle.",
+            ]
+        elif strength == 'medium':
+            removal_lines = [
+                "- Trees and small stones: use RemoveObject (solo). You must be adjacent (distance ≤ 1).",
+                "- Big grey rock: use RemoveObjectTogether with a partner (both must be adjacent).",
+            ]
+        else:  # low
+            removal_lines = [
+                "- Your strength is LOW: you can only remove fallen trees alone (RemoveObject).",
+                "- Small stones and big grey rocks require RemoveObjectTogether with an adjacent partner.",
+            ]
+
+    base_rules = (
+        ["== GAME RULES ==",
+         "Goal:",
+         f"- Search all areas for victims and rescue them by carrying them to the drop zone at {dz} and using Drop.",
+         "- You can only carry one victim at a time.",
+         "",
+         "Carrying victims:"]
+        + carry_lines
+        + ["- After carrying, always navigate to the drop zone and Drop the victim there to score points.",
+           "",
+           "Removing obstacles:"]
+        + removal_lines
+        + ["- Remove obstacles that are blocking your path to victims or areas.",
+           "",
+           "Cooperative actions:",
+           "- CarryObjectTogether and RemoveObjectTogether require partner_id from observation.teammates.",
+           "- Both agents must be adjacent (Chebyshev distance ≤ 1) to the target before calling a cooperative action.",
+           "",
+           "Navigation:",
+           "- Use MoveTo(x, y) or MoveToArea(area) to navigate. You must be adjacent to an object to interact with it.",
+           "- Use EnterArea(area) when you are at the door of an area to enter it.",
+           "- Use SearchArea(area) to systematically cover all cells in an area.",
+           "- NEVER call MoveTo with your own current position — that is a no-op.",
+           ]
+    )
 
     return '\n'.join(base_rules)

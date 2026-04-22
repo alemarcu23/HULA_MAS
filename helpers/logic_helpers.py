@@ -142,12 +142,12 @@ def _get_adjacent(ws: Dict[str, Any]) -> List[Dict[str, Any]]:
                     nearby.append(enriched)
                     break 
 
-    # Teammates: expected as {"id": ..., "x": ..., "y": ...}
+    # Teammates: expected as {"object_id": ..., "x": ..., "y": ...}
     for t in ws.get("teammates", []):
         loc = _extract_location(t)
         if _chebyshev_distance(agent_pos, loc) == 1:
             nearby.append({
-                "id": t["id"],
+                "object_id": t.get("object_id", t.get("id", "unknown")),
                 "type": "teammate",
                 "location": loc,
             })
@@ -172,7 +172,7 @@ def _adjacent_summary(ws: Dict[str, Any], type_filter: Optional[Set[str]] = None
 
     for o in _get_adjacent(ws):
         if o.get("type") in types:
-            desc = f"{o['id']} ({o['type']}"
+            desc = f"{o.get('object_id', o.get('id', '?'))} ({o['type']}"
             if o.get("severity"):
                 desc += f", {o['severity']}"
             desc += f" at {o['location']})"

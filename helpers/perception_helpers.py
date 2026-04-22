@@ -61,14 +61,14 @@ def _serialize_nearby(
             else:
                 severity = "healthy"
             victims.append({
-                "id": obj_id,
+                "object_id": obj_id,
                 "type": obj_type,
                 "location": pos,
                 "severity": severity,
             })
         elif obj_type in ('rock', 'stone', 'tree'):
             obstacles.append({
-                "id": obj_id,
+                "object_id": obj_id,
                 "type": obj_type,
                 "location": pos,
             })

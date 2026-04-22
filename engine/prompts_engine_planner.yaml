@@ -9,7 +9,20 @@ generate_tasks_system: |
   - Do not assign completed objectives.
   - Include specific victim/obstacle IDs and [x, y] coordinates from the WORLD_STATE in task descriptions.
 
+  GAME RULES (always respect):
+  - Critically injured victims ALWAYS require CarryObjectTogether (two agents cooperating).
+  - Big grey rocks ALWAYS require RemoveObjectTogether (two agents cooperating).
+  - Fallen trees can only be removed by the RescueBot (RemoveObject solo).
+  - Small stones can be removed solo (RemoveObject) by any agent.
+  - Agents can only carry one victim at a time.
+  - Cooperative tasks: phrase as "help <partner_id> carry/remove <target_id> at [x,y]".
+
 generate_tasks_user: |
+  EXPECTED OUTPUT SCHEMA:
+  {"tasks": {"<agent_id>": "<task string>", ...}}
+  Optional: {"tasks": {...}, "plans": {"<agent_id>": ["subtask1", "subtask2", ...]}}
+  Cooperative tasks must be phrased as: "help <partner_id> carry/remove <target_id> at [x,y]"
+
   JSON_SCHEMA:
   {json_schema}
   WORLD_STATE:
@@ -25,7 +38,6 @@ generate_tasks_user: |
 summarize_system: |
   Summarize this planning iteration in under 120 words. Output a single plain-text paragraph (no JSON).
   Focus on: which tasks succeeded/failed, what was discovered, remaining objectives, and priorities for next iteration.
-  ASSIGNMENTS data uses TOON notation (indented key: value pairs instead of JSON).
 
 summarize_user: |
   ASSIGNMENTS:
@@ -52,6 +64,7 @@ answer_question_system: |
 
 answer_question_user: |
   AGENT: {agent_id}
+  AGENT CAPABILITIES: {agent_capabilities}
   QUESTION: {question}
   CURRENT TASKS: {current_tasks}
   WORLD_STATE:

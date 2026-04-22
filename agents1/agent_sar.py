@@ -25,7 +25,7 @@ from matrx.agents.agent_utils.state import State
 from matrx.messages.message import Message
 
 from agents1.async_model_prompting import get_llm_result
-from agents1.capabilities import filter_tools_for_capabilities, get_capability_prompt, get_game_rules
+from agents1.capabilities import DISCOVERY_NOTE, get_capability_prompt, get_game_rules
 from agents1.llm_agent_base import LLMAgentBase, SM_TASK_ASSIGNMENTS
 from agents1.modules.area_tracker import AreaExplorationTracker
 from agents1.modules.execution_module import execute_action
@@ -130,11 +130,6 @@ class SearchRescueAgent(LLMAgentBase):
         self._strategy = strategy if strategy in REASONING_STRATEGIES else 'react'
         self.area_tracker = AreaExplorationTracker(self.env_info.get_area_cells())
         self.tools_by_name, self.tool_schemas = build_tool_schemas()
-
-        if self._capabilities:
-            self.tools_by_name, self.tool_schemas = filter_tools_for_capabilities(
-                self.tool_schemas, self.tools_by_name, self._capabilities
-            )
 
         self.reasoning = ReasoningIO('EMPTY')
         self.critic_module = CriticBase('EMPTY')
@@ -365,6 +360,24 @@ class SearchRescueAgent(LLMAgentBase):
             'tick': self._tick_count,
         }
 
+    def _build_common_context(self) -> Dict[str, Any]:
+        """Return game rules and capability text for injection into every LLM stage.
+
+        In 'informed' mode the agent receives its full capability profile.
+        In 'discovery' mode it receives a short note to learn from failures.
+        """
+        if self._capability_knowledge == 'informed':
+            cap_text = get_capability_prompt(self._capabilities)
+        else:
+            cap_text = DISCOVERY_NOTE
+        return {
+            'game_rules': get_game_rules(
+                drop_zone=self.env_info.drop_zone,
+                capabilities=self._capabilities if self._capability_knowledge == 'informed' else None,
+            ),
+            'agent_capabilities': cap_text,
+        }
+
     def critic(self) -> Tuple[Optional[str], Dict]:
         last_name = self._last_action.get('name')
         if not last_name or last_name == 'Idle':
@@ -376,7 +389,7 @@ class SearchRescueAgent(LLMAgentBase):
             **state,
             'observation': self.WORLD_STATE,
             'all_observations': self.WORLD_STATE_GLOBAL,
-            'agent_capabilities': get_capability_prompt(self._capabilities) if self._capability_knowledge == 'informed' else None,
+            **self._build_common_context(),
         }
         self._log_stage_inputs('CRITIC', critic_inputs)
         prompt = self.critic_module.get_critic_prompt(critic_inputs)
@@ -423,7 +436,7 @@ class SearchRescueAgent(LLMAgentBase):
         ]
         if sent_msgs:
             sent_lines = '\n'.join(
-                f"- [YOU → {m['to']}] ({m['type']}) {m['text']}"
+                f"- [YOU → {m['to']}] ({m.get('message_type', m.get('type', 'message'))}) {m['text']}"
                 for m in sent_msgs[-5:]
             )
             teammate_msgs = f'Messages you sent recently:\n{sent_lines}\n\nMessages from teammates:\n{teammate_msgs}'
@@ -433,15 +446,20 @@ class SearchRescueAgent(LLMAgentBase):
             for s in area_summaries
         )
 
+        common_ctx = self._build_common_context()
+        cap_text = common_ctx['agent_capabilities']
+
         system_prompt = (
             'You are a coordination module for a Search and Rescue agent team. '
             'Your job is to broadcast a short status update to your teammates '
             'so they can avoid duplicate work and coordinate effectively.\n\n'
+            f'Your capabilities:\n{cap_text}\n\n'
             'Respond with ONLY a JSON object:\n'
             '{"message": "<your status update to teammates>"}\n\n'
             'The message should briefly state: what you are currently doing, '
             'where you are, what you plan to do next, and any discoveries '
-            '(victims, obstacles) worth sharing. Keep it under 2 sentences.'
+            '(victims, obstacles) worth sharing. Mention if you need help '
+            'due to capability limits (e.g. low medical). Keep it under 2 sentences.'
         )
 
         user_prompt = (
@@ -489,7 +507,8 @@ class SearchRescueAgent(LLMAgentBase):
         }
         self._log_stage_inputs('COMMUNICATION', comm_inputs)
         prompt = self._build_communication_prompt()
-        self.call_llm(prompt)
+        # Cap tokens to enforce the "≤ 2 sentences" brevity requirement mechanically
+        self.call_llm(prompt, max_tokens=200)
         return self._idle()
 
     def _handle_communication_result(self, result) -> Tuple[Optional[str], Dict]:
@@ -517,8 +536,9 @@ class SearchRescueAgent(LLMAgentBase):
                 ))
                 self.memory.update('sent_message', {
                     'entry_type': 'sent_message',
+                    'from': self.agent_id,
                     'to': 'all',
-                    'type': 'coordination',
+                    'message_type': 'message',
                     'text': message_text,
                     'tick': self._tick_count,
                 })
@@ -535,13 +555,16 @@ class SearchRescueAgent(LLMAgentBase):
 
     def plan(self) -> Tuple[Optional[str], Dict]:
         # Get raw messages for planner (messages flow into planning, not reasoning)
-        agent_busy = self._nav_target is not None or self._carry_autopilot is not None
+        agent_busy = (self._nav_target is not None
+                      or self._carry_autopilot is not None
+                      or self._coop_carry_role is not None)
         raw_messages = self.communication.get_messages(limit=10, agent_busy=agent_busy)
 
         state = self._build_canonical_state()
         planning_inputs = {
             'agent_id': self.agent_id,
             **state,
+            **self._build_common_context(),
             'previous_tasks': self.memory.retrieve_all()[-5:],
             'nearby_objects': self.WORLD_STATE.get('victims', []) + self.WORLD_STATE.get('obstacles', []),
             'observed_objects': self.WORLD_STATE_GLOBAL,
@@ -551,7 +574,6 @@ class SearchRescueAgent(LLMAgentBase):
                 f"[{m['from']}] ({m['message_type']}) {m['text']}"
                 for m in raw_messages
             ] if raw_messages else None,
-            'agent_capabilities': get_capability_prompt(self._capabilities) if self._capability_knowledge == 'informed' else None,
         }
         self._log_stage_inputs('PLANNING', planning_inputs)
         prompt = self.planner.get_planning_prompt(planning_inputs)
@@ -589,12 +611,11 @@ class SearchRescueAgent(LLMAgentBase):
         recent_actions_list = list(self._recent_actions)
         reasoning_inputs = {
             **state,
+            **self._build_common_context(),
             'task_decomposition': self._pipeline_context.get('planned_task', self._current_task),
             'observation': observation,
             'memory': self.memory.retrieve_all()[-15:],
             'recent_actions': recent_actions_list,
-            'agent_capabilities': get_capability_prompt(self._capabilities) if self._capability_knowledge == 'informed' else None,
-            'game_rules': get_game_rules(drop_zone=self.env_info.drop_zone),
             'tools_available': list(self.tools_by_name.keys()),
         }
 
@@ -698,8 +719,9 @@ class SearchRescueAgent(LLMAgentBase):
         ))
         self.memory.update('sent_message', {
             'entry_type': 'sent_message',
+            'from': self.agent_id,
             'to': send_to,
-            'type': message_type,
+            'message_type': message_type,
             'text': text,
             'tick': self._tick_count,
         })
@@ -730,6 +752,17 @@ class SearchRescueAgent(LLMAgentBase):
                     f'[{self.agent_id}] MISMATCH: MoveTo{target_str} not found in '
                     f'planned task: {planned[:120]!r}'
                 )
+
+        # Intercept CarryObjectTogether BEFORE validation — the validator rejects
+        # the action when the partner isn't adjacent yet, but our rendezvous state
+        # machine handles navigation; validation is irrelevant here.
+        if name == 'CarryObjectTogether':
+            victim_id = args.get('object_id', '')
+            partner_id = args.get('partner_id', '')
+            if victim_id and self._setup_coop_carry_rendezvous(victim_id, partner_id):
+                self._pipeline_stage = PipelineStage.IDLE
+                return self._idle('rendezvous_initiated')
+            # Setup failed (victim location unknown) — fall through to validate + dispatch
 
         # Validate
         check = self._validate_action(name, args)

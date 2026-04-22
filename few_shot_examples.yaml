@@ -4,7 +4,7 @@
 reasoning:
   - user: |
       TASK: Navigate to room entrance at [5, 3]
-      WORLD_STATE: {"victims":[],"obstacles":[{"id":"stone_1","type":"stone","location":[4,3]}],"doors":[{"area":"area_1","location":[5,3]}],"teammate_positions":{}}
+      WORLD_STATE: {"victims":[],"obstacles":[{"object_id":"stone_1","type":"stone","location":[4,3]}],"doors":[{"area":"area_1","location":[5,3]}],"teammate_positions":{}}
       POS: [3, 3]  CARRYING: nothing
       NEARBY: {"stone:stone_1":["(4, 3)"]}
       LAST_ACTIONS: 1. MoveTo([4, 3])
@@ -13,7 +13,7 @@ reasoning:
 
   - user: |
       TASK: Remove obstacle at [9, 2]
-      WORLD_STATE: {"victims":[],"obstacles":[{"id":"rock_1","type":"big_rock","location":[9,2]}],"doors":[{"area":"area_2","location":[9,4]}],"teammate_positions":{"rescuebot1":[20,11]}}
+      WORLD_STATE: {"victims":[],"obstacles":[{"object_id":"rock_1","type":"big_rock","location":[9,2]}],"doors":[{"area":"area_2","location":[9,4]}],"teammate_positions":{"rescuebot1":[20,11]}}
       POS: [8, 6]  CARRYING: nothing
       NEARBY: {}
       LAST_ACTIONS: 1. MoveTo([8, 6])
@@ -22,13 +22,13 @@ reasoning:
 
   - user: |
       TASK: Rescue critical victim victim_3 at [8, 6]
-      WORLD_STATE: {"victims":[{"id":"victim_3","type":"critical","location":[8,6]}],"obstacles":[],"doors":[{"area":"area_6","location":[9,7]}],"teammate_positions":{"humanagent":[8,7]}}
+      WORLD_STATE: {"victims":[{"object_id":"victim_3","type":"critical","location":[8,6]}],"obstacles":[],"doors":[{"area":"area_6","location":[9,7]}],"teammate_positions":{"humanagent":[8,7]}}
       POS: [8, 6]  CARRYING: nothing
       NEARBY: {"critical_victim:victim_3":["(8, 6)"],"human":[8,7]}
       LAST_ACTIONS: 1. MoveTo([8, 6])
       ACTION FEEDBACK: none
     assistant: |
-      {"action": "CarryObjectTogether", "params": {"object_id": "victim_3"}}
+      {"action": "CarryObjectTogether", "params": {"object_id": "victim_3", "partner_id": "humanagent"}}
 
   - user: |
       TASK: Remove stone_3 blocking path to area_2
@@ -48,7 +48,7 @@ generate_tasks:
       area_2,"[9, 4]"
       area_3,"[15, 4]"
       area_4,"[21, 4]"
-      known_obstacles[1]{id,type,location}:
+      known_obstacles[1]{object_id,type,location}:
         rock_1,big_rock,"[3, 4]"
       teammate_positions:
       rescuebot1[2]: 21,11
@@ -60,7 +60,7 @@ generate_tasks:
 
       Assign one task per agent.
     assistant: |
-      {"tasks": {"rescuebot0": "Explore Area 2 starting from entrance at [9, 4] and search for victims", "rescuebot1": "Remove rock_1 (big_rock) blocking Area 1 entrance at [3, 4] using RemoveObject"}}
+      {"tasks": {"rescuebot0": "Explore Area 2 starting from entrance at [9, 4] and search for victims", "rescuebot1": "help rescuebot0 remove rock_1 (big_rock) blocking Area 1 entrance at [3, 4] using RemoveObjectTogether"}}
 
 # ── Iteration summarization (EnginePlanner / summarize_system) ────────────────
 summarize:
@@ -73,8 +73,8 @@ summarize:
       rescuebot0: Explore Area 1 -> completed (found mildly_injured_woman at [3, 3])
       rescuebot1: Explore Area 2 -> ticks_exhausted (partially explored, found stone blocking door)
       WORLD_STATE:
-      victims[1]{id,type,location}: mildly_injured_woman,mild,"[3, 3]"
-      obstacles[1]{id,type,location}: stone_2,stone,"[9, 4]"
+      victims[1]{object_id,type,location}: mildly_injured_woman,mild,"[3, 3]"
+      obstacles[1]{object_id,type,location}: stone_2,stone,"[9, 4]"
       SCORE:
       Victims rescued: 0/8, Score: 0, Block hit rate: 0.0
     assistant: |
@@ -107,12 +107,12 @@ planning_decompose:
       MEMORY: None
 
     assistant: |
-      Subtask1: Go to the door of Area 1 at [3, 4], as found in the world state-doors.
-      Subtask2: Remove any obstacle blocking the door if present (not mentioned in world state, so may or may not be there).
-      Subtask3: Search Area 1 for victims.
-      Subtask4: Move next to the victim and carry it
-      Subtask5: Navigate to the drop zone
-      Subtask6: Drop the victim at the drop zone
+      1. Go to the door of Area 1 at [3, 4].
+      2. Remove any obstacle blocking the door if present.
+      3. Search Area 1 for victims.
+      4. Move adjacent to the victim and carry it (CarryObject or CarryObjectTogether depending on severity).
+      5. Navigate to the drop zone.
+      6. Drop the victim at the drop zone.
 
 
 # ── Plan evaluation (PlanningModule / planning_evaluate_system) ───────────────
@@ -122,10 +122,68 @@ planning_evaluate:
   # - user: |
   #     ORIGINAL TASK: Rescue mild victim victim_2 at [10, 4]
   #     EXECUTED SUBTASKS: [MoveTo [10,4], CarryObject victim_2, NavigateToDropZone, Drop victim_2]
-  #     CURRENT WORLD STATE: {"known_victims": [{"id":"victim_2","type":"mild","location":[23,8],"rescued":true}]}
+  #     CURRENT WORLD STATE: {"known_victims": [{"object_id":"victim_2","type":"mild","location":[23,8],"rescued":true}]}
   #     MEMORY: victim_2 delivered tick 55
   #   assistant: |
   #     {"success": true, "reason": "victim_2 was carried and dropped at drop zone (23,8)"}
+
+
+# ── Next-task planning (PlanningModule / get_planning_prompt) ─────────────────
+planning_next_task:
+  - user: |
+      agent_id: rescuebot0
+      position: [10, 4]
+      current_task: Rescue mild victim mildly_injured_woman at [10, 4]
+      critic_feedback: {"success": true, "critique": ""}
+      nearby_objects:
+        victims[1]{object_id,severity,location}: mildly_injured_woman,mild,"[10, 4]"
+        obstacles[0]:
+      observed_objects:
+        victims[1]{object_id,severity,location}: mildly_injured_woman,mild,"[10, 4]"
+        obstacles[0]:
+      rescued_victims[0]:
+      area_exploration: {area_1: 80%, area_2: 0%}
+      messages[0]:
+      agent_capabilities: medical=high, strength=medium, vision=high, speed=fast
+    assistant: |
+      CarryObject mildly_injured_woman at [10, 4], then NavigateToDropZone and Drop to score rescue points.
+
+  - user: |
+      agent_id: rescuebot0
+      position: [8, 6]
+      current_task: Remove rock blocking Area 3 entrance at [15, 4]
+      critic_feedback: {"success": false, "critique": "RemoveObject failed: rock_2 requires cooperative removal (RemoveObjectTogether)"}
+      nearby_objects:
+        victims[0]:
+        obstacles[1]{object_id,type,location}: rock_2,rock,"[15, 4]"
+      observed_objects:
+        victims[0]:
+        obstacles[1]{object_id,type,location}: rock_2,rock,"[15, 4]"
+      rescued_victims[0]:
+      area_exploration: {area_1: 100%, area_3: 0%}
+      messages[0]:
+      agent_capabilities: medical=low, strength=medium, vision=medium, speed=normal
+      teammates[1]{object_id,location}: rescuebot1,"[12, 5]"
+    assistant: |
+      SendMessage to rescuebot1 asking for help: "I need help removing rock_2 at [15, 4] — it requires RemoveObjectTogether. Can you come to [15, 4]?" (message_type=ask_help)
+
+  - user: |
+      agent_id: rescuebot1
+      position: [3, 3]
+      current_task: Explore Area 1
+      critic_feedback: {"success": true, "critique": ""}
+      nearby_objects:
+        victims[0]:
+        obstacles[0]:
+      observed_objects:
+        victims[0]:
+        obstacles[0]:
+      rescued_victims[0]:
+      area_exploration: {area_1: 40%, area_2: 0%}
+      messages[1]{from,message_type,text}: rescuebot0,ask_help,"I need help removing rock_2 at [15, 4]. Can you come to [15, 4]?"
+      agent_capabilities: medical=high, strength=high, vision=low, speed=normal
+    assistant: |
+      Respond to rescuebot0's ask_help: SendMessage help to rescuebot0 "On my way to [15, 4] to help with rock_2." then MoveTo [15, 4] to assist with RemoveObjectTogether.
 
 
 # ── Planner answering agent questions (EnginePlanner / answer_question_*) ─────
@@ -135,7 +193,7 @@ planner_answer:
       QUESTION: I found a big rock blocking the entrance to area 3. Should I wait for help or explore elsewhere?
       CURRENT TASKS: {"rescuebot0": "Explore Area 3", "rescuebot1": "Rescue victim_1 in Area 1"}
       WORLD_STATE:
-      known_obstacles[1]{id,type,location}:
+      known_obstacles[1]{object_id,type,location}:
         rock_1,big_rock,"[15, 4]"
       teammate_positions:
         rescuebot1[2]: 3,3

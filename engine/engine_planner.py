@@ -533,15 +533,13 @@ class EnginePlanner(ArtificialAgentBrain):
             json_schema += ', "human_task": "suggested task for human"'
 
         num_agents = len(agent_ids)
-        system_prompt = PROMPTS['generate_tasks_system'].format(
-            num_agents=num_agents
-        )
+        # generate_tasks_system has no format placeholders — use as-is
+        system_prompt = PROMPTS['generate_tasks_system']
 
         human_line = '- Human' if self._include_human else ''
 
         user_prompt = PROMPTS['generate_tasks_user'].format(
             world_state_summary=to_toon(self._world_state),
-            num_agents=num_agents,
             json_schema=json_schema,
             agent_ids_formatted=agent_ids_formatted,
             human_line=human_line,
@@ -637,9 +635,16 @@ class EnginePlanner(ArtificialAgentBrain):
         elif self._rescue_agent_ids:
             current_tasks = {aid: '(pending)' for aid in self._rescue_agent_ids}
 
+        # Include agent capabilities if known
+        caps = self._rescue_agent_caps.get(agent_id)
+        agent_capabilities = (
+            ', '.join(f'{k}: {v}' for k, v in caps.items()) if caps else 'unknown'
+        )
+
         system_prompt = PROMPTS['answer_question_system']
         user_prompt = PROMPTS['answer_question_user'].format(
             agent_id=agent_id,
+            agent_capabilities=agent_capabilities,
             question=question,
             world_state=to_toon(self._world_state),
             current_tasks=json.dumps(current_tasks, default=str),
@@ -650,6 +655,7 @@ class EnginePlanner(ArtificialAgentBrain):
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             api_base=self._api_base,
+            few_shot_messages=load_few_shot('planner_answer'),
             max_token_num=2000,
             temperature=0.2,
         )
