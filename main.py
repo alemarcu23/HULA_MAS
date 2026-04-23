@@ -23,7 +23,7 @@ if __name__ == "__main__":
     # ── Deployment ──────────────────────────────────────────────────────────────
     # hpc_mode=True:  headless HPC run (transformers backend, no GUI)
     # hpc_mode=False: local dev    (Ollama backend, browser GUI at localhost:3000)
-    hpc_mode   = False
+    hpc_mode   = True
     enable_gui = not hpc_mode
 
     # ── LLM / Model ─────────────────────────────────────────────────────────────
