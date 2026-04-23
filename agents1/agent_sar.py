@@ -24,12 +24,18 @@ from helpers.navigation_helpers import apply_navigation
 from matrx.agents.agent_utils.state import State
 from matrx.messages.message import Message
 
-from agents1.async_model_prompting import get_llm_result
+from agents1.async_model_prompting import get_llm_result, _strip_thinking
 from agents1.capabilities import DISCOVERY_NOTE, get_capability_prompt, get_game_rules
 from agents1.llm_agent_base import LLMAgentBase, SM_TASK_ASSIGNMENTS
 from agents1.modules.area_tracker import AreaExplorationTracker
 from agents1.modules.execution_module import execute_action
-from agents1.modules.reasoning_module import ReasoningIO
+from agents1.modules.reasoning_module import (
+    ReasoningIO,
+    ReasoningReAct,
+    REASONING_STRATEGY_REGISTRY,
+    FollowupRequest,
+    ActionCommit,
+)
 from agents1.modules.task_critic_module import CriticBase
 from agents1.tool_registry import REASONING_STRATEGIES, build_tool_schemas
 from memory.shared_memory import SharedMemory
@@ -107,6 +113,8 @@ class SearchRescueAgent(LLMAgentBase):
         include_human: bool = True,
         shared_memory: Optional[SharedMemory] = None,
         planning_mode: str = 'simple',
+        planning_strategy: str = 'io',
+        replanning_policy: str = 'every_turn',
         api_base: Optional[str] = None,
         capabilities: Optional[Dict] = None,
         capability_knowledge: str = 'informed',
@@ -123,6 +131,7 @@ class SearchRescueAgent(LLMAgentBase):
             include_human=include_human,
             shared_memory=shared_memory,
             planning_mode=planning_mode,
+            planning_strategy=planning_strategy,
             api_base=api_base,
             capabilities=capabilities,
             capability_knowledge=capability_knowledge,
@@ -130,11 +139,17 @@ class SearchRescueAgent(LLMAgentBase):
             env_info=env_info,
             use_planner=use_planner,
         )
-        self._strategy = strategy if strategy in REASONING_STRATEGIES else 'react'
+        # Resolve reasoning strategy via registry (falls back to ReAct).
+        self._strategy = strategy if strategy in REASONING_STRATEGY_REGISTRY else 'react'
+        self._replanning_policy = (
+            replanning_policy if replanning_policy in ('every_turn', 'critic_gated')
+            else 'every_turn'
+        )
         self.area_tracker = AreaExplorationTracker(self.env_info.get_area_cells())
         self.tools_by_name, self.tool_schemas = build_tool_schemas()
 
-        self.reasoning = ReasoningIO('EMPTY')
+        reasoning_cls = REASONING_STRATEGY_REGISTRY.get(self._strategy, ReasoningReAct)
+        self.reasoning = reasoning_cls()
         self.critic_module = CriticBase('EMPTY')
 
         # Pipeline state
@@ -161,7 +176,8 @@ class SearchRescueAgent(LLMAgentBase):
         print(
             f'[SearchRescueAgent] Created '
             f'(model={llm_model}, strategy={self._strategy}, '
-            f'planning={planning_mode}, caps={capabilities})'
+            f'planning={planning_mode}, plan_strategy={planning_strategy}, '
+            f'replan={self._replanning_policy}, caps={capabilities})'
         )
 
         # Print area tracker initialisation summary so we can verify
@@ -407,7 +423,7 @@ class SearchRescueAgent(LLMAgentBase):
         return self._idle()
 
     def _handle_critic_result(self, result) -> Tuple[Optional[str], Dict]:
-        text = getattr(result[0], 'content', '') or ''
+        text = _strip_thinking(getattr(result[0], 'content', '') or '') or ''
         try:
             critic_result = json.loads(text)
         except (json.JSONDecodeError, TypeError):
@@ -416,6 +432,35 @@ class SearchRescueAgent(LLMAgentBase):
         self._pipeline_context['critic_result'] = critic_result
         self.memory.update('critic_feedback', critic_result)
         print(f'[{self.agent_id}] Critic result: success={critic_result.get("success")}')
+
+        # Critic-gated replanning: on success, advance the DAG; on failure,
+        # skip replanning and let reasoning try a different action using the
+        # critique. Only re-plan when the DAG/plan has been fully drained.
+        if self._replanning_policy == 'critic_gated':
+            success = bool(critic_result.get('success'))
+            active = self.planner.get_active_subtask_description()
+
+            if success and active is not None:
+                advanced = self.planner.advance_active_task()
+                print(
+                    f'[{self.agent_id}] Critic-gated: advancing DAG '
+                    f'(completed="{(advanced or "")[:80]}")'
+                )
+                self._pipeline_context['_skip_planning_llm'] = True
+
+                if self.planner.is_fully_completed():
+                    # Plan drained → fall through to normal flow so next stages
+                    # trigger a full replan via decomposition.
+                    self._pipeline_context.pop('_skip_planning_llm', None)
+
+            elif (not success) and active is not None:
+                # Do not re-plan; reasoning will use critic_feedback.critique
+                # and the last_critique input to pick a different action.
+                print(
+                    f'[{self.agent_id}] Critic-gated: skipping replan on failure '
+                    f'(active="{active[:80]}")'
+                )
+                self._pipeline_context['_skip_planning_llm'] = True
 
         self._pipeline_stage = PipelineStage.COMMUNICATION
         return self._advance_pipeline()
@@ -593,6 +638,18 @@ class SearchRescueAgent(LLMAgentBase):
     # ── PLANNING stage ──────────────────────────────────────────────────
 
     def plan(self) -> Tuple[Optional[str], Dict]:
+        # Critic-gated policy may have short-circuited planning this tick. In
+        # that case, reuse the current active subtask as the planned_task and
+        # skip straight to REASONING.
+        if self._pipeline_context.get('_skip_planning_llm'):
+            active = self.planner.get_active_subtask_description() or self._current_task or ''
+            self._pipeline_context['planned_task'] = active
+            if active:
+                self._current_task = active
+            self._pipeline_context.pop('_skip_planning_llm', None)
+            self._pipeline_stage = PipelineStage.REASONING
+            return self._advance_pipeline()
+
         # Get raw messages for planner (messages flow into planning, not reasoning)
         agent_busy = (self._nav_target is not None
                       or self._carry_autopilot is not None
@@ -621,7 +678,7 @@ class SearchRescueAgent(LLMAgentBase):
         return self._idle()
 
     def _handle_planning_result(self, result) -> Tuple[Optional[str], Dict]:
-        text = getattr(result[0], 'content', '') or ''
+        text = _strip_thinking(getattr(result[0], 'content', '') or '') or ''
         task = text.strip()
         self._pipeline_context['planned_task'] = task
         self.memory.update('planned_task', {'task': task, 'tick': self._tick_count})
@@ -638,6 +695,11 @@ class SearchRescueAgent(LLMAgentBase):
     # ── REASONING stage ─────────────────────────────────────────────────
 
     def reason(self) -> Tuple[Optional[str], Dict]:
+        # Reset the reasoning strategy's FSM at the start of each fresh
+        # reasoning step. Two-pass strategies advance their internal phase via
+        # on_llm_result() — only reset if the previous step has concluded.
+        if getattr(self.reasoning, '_phase', 'main') in ('main', 'done'):
+            self.reasoning.reset_phase()
         self.memory.compress()
         observation = dict(self.WORLD_STATE)
         global_state = self.WORLD_STATE_GLOBAL
@@ -650,6 +712,9 @@ class SearchRescueAgent(LLMAgentBase):
 
         state = self._build_canonical_state()
         recent_actions_list = list(self._recent_actions)
+        last_critique = (
+            self._pipeline_context.get('critic_result') or {}
+        ).get('critique', '')
         reasoning_inputs = {
             **state,
             **self._build_common_context(),
@@ -657,6 +722,7 @@ class SearchRescueAgent(LLMAgentBase):
             'observation': observation,
             'memory': self.memory.retrieve_all()[-15:],
             'recent_actions': recent_actions_list,
+            'last_critique': last_critique,
             'tools_available': list(self.tools_by_name.keys()),
         }
 
@@ -681,6 +747,37 @@ class SearchRescueAgent(LLMAgentBase):
 
     def _handle_reasoning_result(self, llm_response) -> Tuple[Optional[str], Dict]:
         message = llm_response[0]
+
+        # Two-pass strategies (Self-Refine, Self-Reflective-ToT) hook here to
+        # either (a) request a follow-up LLM call and stay in REASONING, or
+        # (b) commit a final (name, args) action directly.
+        hook_result = None
+        try:
+            hook_result = self.reasoning.on_llm_result(message, self)
+        except Exception as exc:
+            logger.warning('[%s] reasoning.on_llm_result raised: %s', self.agent_id, exc)
+
+        if isinstance(hook_result, FollowupRequest):
+            self.call_llm(
+                hook_result.messages,
+                tools=hook_result.tools,
+                tool_choice=hook_result.tool_choice,
+            )
+            self._pipeline_stage = PipelineStage.REASONING
+            return self._idle()
+
+        if isinstance(hook_result, ActionCommit):
+            name, args = hook_result.name, hook_result.args
+            print(f'[{self.agent_id}] Reasoning strategy committed action: {name}({args})')
+            self._pipeline_context['action_name'] = name
+            self._pipeline_context['action_args'] = args
+            self._pipeline_context['_reasoning_retries'] = 0
+            self._pipeline_stage = (
+                PipelineStage.COMM_DISPATCH
+                if name == 'SendMessage'
+                else PipelineStage.EXECUTE
+            )
+            return self._advance_pipeline()
 
         # Path A: structured tool_call
         tool_calls = getattr(message, 'tool_calls', None)
@@ -847,7 +944,13 @@ class SearchRescueAgent(LLMAgentBase):
         self.memory.update('action', {'action': action_name, 'args': kwargs})
         self._recent_actions.append({'name': action_name, 'args': kwargs})
 
-        if task_completing and task_completing != 'N/A':
+        if (
+            task_completing and task_completing != 'N/A'
+            and self._replanning_policy != 'critic_gated'
+        ):
+            # In critic_gated mode, DAG advancement is driven solely by the
+            # critic's success verdict — not by the agent's self-reported
+            # task_completing field — to avoid double-advancement.
             self.planner.advance_task(task_completing)
 
         if self.metrics:

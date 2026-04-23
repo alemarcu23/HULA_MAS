@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import ast
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Any, Optional
@@ -94,6 +95,115 @@ Input fields reference:
 - agent_capabilities: YOUR physical capabilities — only assign tasks feasible for you
 """
 
+
+# ── Strategy-specific prompt addenda ────────────────────────────────────────
+# Each strategy prepends a short instruction block to the base prompt,
+# adapted from the reference paper (ALFWorld → Search & Rescue).
+
+_STRATEGY_ADDENDA: Dict[str, str] = {
+    'io': "",  # baseline
+    'deps': (
+        "[DEPS] You are a helper AI agent. Generate a sequence of sub-goals "
+        "(actions) for the search-and-rescue task below. Reason about each "
+        "sub-goal and the tool call it requires. Prefer decompositions that "
+        "thread through explicit multi-hop intermediate states (e.g. reach "
+        "door → search area → pick victim → reach drop zone → drop).\n\n"
+    ),
+    'td': (
+        "[TD] Produce a plan with explicit temporal dependencies: each "
+        "subtask must list which prior subtasks must be completed first. "
+        "This avoids parallel conflicts and out-of-order execution.\n\n"
+    ),
+    'voyager': (
+        "[Voyager] You are a helpful assistant that generates sub-goals to "
+        "complete the search-and-rescue task. Criteria:\n"
+        "  1) Return a list of sub-goals executable in order.\n"
+        "  2) For each sub-goal give a brief reasoning and the tool to call.\n"
+        "Keep the list minimal and executable.\n\n"
+    ),
+    'openagi': (
+        "[OpenAGI] You are a planner who is an expert at coming up with a "
+        "concise todo list for the search-and-rescue objective. Ensure the "
+        "list is as short as possible and each item is relevant, effective, "
+        "and described in a single sentence.\n\n"
+    ),
+    'hugginggpt': (
+        "[HuggingGPT] Think step by step about all the tasks needed to "
+        "resolve the mission. Parse out as few tasks as possible while still "
+        "resolving the mission. Pay attention to dependencies and order "
+        "among tasks.\n\n"
+    ),
+}
+
+
+# ── Strategy classes ────────────────────────────────────────────────────────
+
+class PlanningBase:
+    """Base planning strategy — no prompt decoration, IO-style behavior.
+
+    Subclasses override ``prefix`` to prepend strategy-specific instructions
+    to the base planning/decomposition prompt.
+    """
+
+    prefix: str = _STRATEGY_ADDENDA['io']
+
+    def decorate_system_prompt(self, base_prompt: str) -> str:
+        return (self.prefix + base_prompt) if self.prefix else base_prompt
+
+    @staticmethod
+    def parse_decomposition_dicts(text: str) -> List[Dict[str, Any]]:
+        """Extract `{...}` dicts from the LLM output (reference-paper parser)."""
+        dict_strings = re.findall(r"\{[^{}]*\}", text)
+        dicts: List[Dict[str, Any]] = []
+        for ds in dict_strings:
+            try:
+                parsed = ast.literal_eval(ds)
+                if isinstance(parsed, dict):
+                    dicts.append(parsed)
+            except (ValueError, SyntaxError):
+                continue
+        return dicts
+
+
+class PlanningIO(PlanningBase):
+    prefix = _STRATEGY_ADDENDA['io']
+
+
+class PlanningDEPS(PlanningBase):
+    prefix = _STRATEGY_ADDENDA['deps']
+
+
+class PlanningTD(PlanningBase):
+    prefix = _STRATEGY_ADDENDA['td']
+
+
+class PlanningVoyager(PlanningBase):
+    prefix = _STRATEGY_ADDENDA['voyager']
+
+
+class PlanningOPENAGI(PlanningBase):
+    prefix = _STRATEGY_ADDENDA['openagi']
+
+
+class PlanningHuggingGPT(PlanningBase):
+    prefix = _STRATEGY_ADDENDA['hugginggpt']
+
+
+PLANNING_STRATEGY_REGISTRY: Dict[str, type] = {
+    'io':         PlanningIO,
+    'deps':       PlanningDEPS,
+    'td':         PlanningTD,
+    'voyager':    PlanningVoyager,
+    'openagi':    PlanningOPENAGI,
+    'hugginggpt': PlanningHuggingGPT,
+}
+
+
+def build_planning_strategy(name: str) -> PlanningBase:
+    cls = PLANNING_STRATEGY_REGISTRY.get(name, PlanningIO)
+    return cls()
+
+
 _STOP_WORDS = frozenset({
     'the', 'a', 'an', 'to', 'at', 'for', 'and', 'or', 'is', 'in', 'of',
     'it', 'its', 'this', 'that', 'be', 'by', 'on', 'with', 'from',
@@ -101,8 +211,10 @@ _STOP_WORDS = frozenset({
 
 
 class Planning:
-    def __init__(self, mode: str = 'simple') -> None:
+    def __init__(self, mode: str = 'simple', strategy: str = 'io') -> None:
         self.mode = mode
+        self.strategy_name = strategy
+        self.strategy = build_planning_strategy(strategy)
         self.task_decomposition: List[SubTask] = []
         self.task_graph: Optional[TaskGraph] = None
         self.current_task = ''
@@ -120,19 +232,74 @@ class Planning:
             self.task_decomposition[0].status = TaskStatus.ACTIVE
         if self.mode == 'dag':
             self.task_graph = TaskGraph.from_task_list(decomposition)
-                
+
+    def get_active_subtask_description(self) -> Optional[str]:
+        """Return the current ACTIVE subtask description, or None."""
+        if self.mode == 'dag' and self.task_graph is not None:
+            node = self.task_graph.get_current_task()
+            return node.description if node is not None else None
+        active = next(
+            (st for st in self.task_decomposition if st.status == TaskStatus.ACTIVE),
+            None,
+        )
+        return active.description if active is not None else None
+
+    def is_fully_completed(self) -> bool:
+        """True iff no ACTIVE or PENDING subtask remains (plan drained)."""
+        if self.mode == 'dag':
+            if self.task_graph is None:
+                return True
+            return self.task_graph.is_empty()
+        if not self.task_decomposition:
+            return True
+        return not any(
+            st.status in (TaskStatus.ACTIVE, TaskStatus.PENDING)
+            for st in self.task_decomposition
+        )
+
+    def advance_active_task(self) -> Optional[str]:
+        """Force-advance the current ACTIVE subtask (used by critic-gated flow).
+
+        Unlike ``advance_task(task_completing)``, this does not require a
+        string match — it unconditionally marks the active node complete and
+        activates the next one. Returns the description of the task that was
+        advanced, or None if nothing was active.
+        """
+        if self.mode == 'dag':
+            if self.task_graph is None:
+                return None
+            node = self.task_graph.get_current_task()
+            if node is None:
+                return None
+            desc = node.description
+            self.task_graph.advance()
+            return desc
+        active = next(
+            (st for st in self.task_decomposition if st.status == TaskStatus.ACTIVE),
+            None,
+        )
+        if active is None:
+            return None
+        desc = active.description
+        active.status = TaskStatus.COMPLETED
+        for st in self.task_decomposition:
+            if st.status == TaskStatus.PENDING:
+                st.status = TaskStatus.ACTIVE
+                break
+        logger.info("Critic-gated advance: '%s'", desc)
+        return desc
+
     def get_planning_prompt(self, information: Dict[str, Any]) -> List[Dict[str, str]]:
         print("Generating planning prompt with information:", json.dumps(to_toon(information), indent=2, default=str))
 
-        # Inject capability-aware game rules into the system prompt
         game_rules = information.get('game_rules', '')
-        system_content = PLANNER_PROMPT
+        # Apply strategy decorator, then append game rules (if any)
+        system_content = self.strategy.decorate_system_prompt(PLANNER_PROMPT)
         if game_rules:
-            system_content = f"{PLANNER_PROMPT}\n\n{game_rules}"
+            system_content = f"{system_content}\n\n{game_rules}"
 
         messages = [{"role": "system", "content": system_content}]
 
-        # Load few-shot examples for next-task planning
         try:
             examples = load_few_shot('planning_next_task')
             for ex in examples:
@@ -159,11 +326,24 @@ class Planning:
             "feedback": feedback,
         }
 
-        return [
-            {"role": "system", "content": TASK_DECOMPOSITION_PROMPT},
-            {"role": "user",   "content": to_toon(info_dict)},
+        system_content = self.strategy.decorate_system_prompt(TASK_DECOMPOSITION_PROMPT)
+
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system_content},
         ]
-    
+
+        try:
+            examples = load_few_shot('planning_decompose')
+            for ex in examples:
+                if 'user' in ex and 'assistant' in ex:
+                    messages.append({"role": "user", "content": ex['user'].strip()})
+                    messages.append({"role": "assistant", "content": ex['assistant'].strip()})
+        except Exception:
+            pass
+
+        messages.append({"role": "user", "content": to_toon(info_dict)})
+        return messages
+
     def advance_task(self, task_completing: str = '') -> None:
         """Advance the active task if task_completing matches it."""
         if not task_completing:
@@ -315,4 +495,3 @@ def _is_task_match(task_completing: str, task_description: str) -> bool:
     if not tc_words:
         return False
     return len(tc_words & td_words) / len(tc_words) >= 0.5
-

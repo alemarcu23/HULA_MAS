@@ -68,6 +68,8 @@ def add_agents(builder, condition, name, folder, agent_type='baseline',
                api_base="http://localhost:11434", agent_model='qwen3:8b',
                planning_mode='simple', agent_presets=None,
                capability_knowledge='informed', comm_strategies=None,
+               reasoning_strategies=None, planning_strategies=None,
+               replanning_policies=None,
                env_info=None, agent_starts=None, use_planner=True):
     """
     Add agents to the world.
@@ -99,6 +101,21 @@ def add_agents(builder, condition, name, folder, agent_type='baseline',
         comm_strategies = ['always_respond'] * num_rescue_agents
     while len(comm_strategies) < num_rescue_agents:
         comm_strategies.append(comm_strategies[-1] if comm_strategies else 'always_respond')
+
+    if reasoning_strategies is None:
+        reasoning_strategies = ['react'] * num_rescue_agents
+    while len(reasoning_strategies) < num_rescue_agents:
+        reasoning_strategies.append(reasoning_strategies[-1] if reasoning_strategies else 'react')
+
+    if planning_strategies is None:
+        planning_strategies = ['io'] * num_rescue_agents
+    while len(planning_strategies) < num_rescue_agents:
+        planning_strategies.append(planning_strategies[-1] if planning_strategies else 'io')
+
+    if replanning_policies is None:
+        replanning_policies = ['every_turn'] * num_rescue_agents
+    while len(replanning_policies) < num_rescue_agents:
+        replanning_policies.append(replanning_policies[-1] if replanning_policies else 'every_turn')
 
     if agent_starts is None:
         agent_starts = [(22, 11), (21, 11), (20, 11), (22, 10), (21, 10)]
@@ -132,10 +149,12 @@ def add_agents(builder, condition, name, folder, agent_type='baseline',
                     name=name,
                     folder=folder,
                     llm_model=agent_model,
-                    strategy='react',
+                    strategy=reasoning_strategies[agent_nr],
                     include_human=include_human,
                     shared_memory=shared_memory,
                     planning_mode=planning_mode,
+                    planning_strategy=planning_strategies[agent_nr],
+                    replanning_policy=replanning_policies[agent_nr],
                     api_base=api_base,
                     capabilities=caps,
                     capability_knowledge=capability_knowledge,
@@ -227,6 +246,8 @@ def create_builder(condition, name, folder, agent_type='baseline',
                    api_base="http://localhost:11434", agent_model='qwen3:8b',
                    planning_mode='simple', agent_presets=None,
                    capability_knowledge='informed', comm_strategies=None,
+                   reasoning_strategies=None, planning_strategies=None,
+                   replanning_policies=None,
                    world_preset='static', world_seed=None, enable_gui=True,
                    planner_config=None, use_planner=True, score_file=None):
     # Set numpy's random generator
@@ -360,6 +381,9 @@ def create_builder(condition, name, folder, agent_type='baseline',
                         agent_presets=agent_presets,
                         capability_knowledge=capability_knowledge,
                         comm_strategies=comm_strategies,
+                        reasoning_strategies=reasoning_strategies,
+                        planning_strategies=planning_strategies,
+                        replanning_policies=replanning_policies,
                         env_info=env_info,
                         agent_starts=agent_starts,
                         use_planner=use_planner)

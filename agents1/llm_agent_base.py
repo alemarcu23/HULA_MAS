@@ -87,6 +87,7 @@ class LLMAgentBase(ArtificialBrain, Perception):
         include_human: bool = True,
         shared_memory: Optional[SharedMemory] = None,
         planning_mode: str = 'simple',
+        planning_strategy: str = 'io',
         api_base: Optional[str] = None,
         capabilities: Optional[Dict] = None,
         capability_knowledge: str = 'informed',
@@ -131,7 +132,8 @@ class LLMAgentBase(ArtificialBrain, Perception):
         self.shared_memory: Optional[SharedMemory] = shared_memory
 
         # ── Planning ───────────────────────────────────────────────────────
-        self.planner = Planning(mode=planning_mode)
+        self._planning_strategy = planning_strategy
+        self.planner = Planning(mode=planning_mode, strategy=planning_strategy)
         self.task_num: int = 0
 
         # ── Navigation ─────────────────────────────────────────────────────

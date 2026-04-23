@@ -413,11 +413,11 @@ def _completion_transformers(
         raw_output = raw_output.replace(tok, "")
     raw_output = raw_output.strip()
 
-    # Parse tool calls if tools were provided
+    # Parse tool calls if tools were provided; always strip <think> blocks
     if tools:
         content, tool_calls = _parse_qwen3_tool_calls(raw_output)
     else:
-        content = raw_output or None
+        content = _strip_thinking(raw_output) or None
         tool_calls = None
 
     return [_Message(content=content, tool_calls=tool_calls)]

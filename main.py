@@ -60,6 +60,20 @@ if __name__ == "__main__":
     # 'always_respond' | 'busy_aware'
     comm_strategies = ['always_respond', 'always_respond']
 
+    # Reasoning strategy per agent; cycles if shorter than num_rescue_agents.
+    # 'io' | 'cot' | 'react' | 'reflexion' | 'self_refine' | 'self_reflective_tot'
+    reasoning_strategies = ['react', 'react']
+
+    # Planning strategy per agent; cycles if shorter than num_rescue_agents.
+    # 'io' | 'deps' | 'td' | 'voyager' | 'openagi' | 'hugginggpt'
+    planning_strategies = ['io', 'io']
+
+    # Replanning policy per agent; cycles if shorter than num_rescue_agents.
+    # 'every_turn'  = run planner on every tick (current behavior)
+    # 'critic_gated' = advance DAG on critic success, skip replan on failure,
+    #                  only re-decompose when the plan is fully drained
+    replanning_policies = ['every_turn', 'every_turn']
+
     # ── Planning ─────────────────────────────────────────────────────────────────
     # 'simple' = flat task list; 'dag' = task graph with conditional branching
     planning_mode = 'dag'
@@ -126,6 +140,9 @@ if __name__ == "__main__":
             planning_mode=planning_mode,
             agent_presets=agent_presets, capability_knowledge=capability_knowledge,
             comm_strategies=comm_strategies,
+            reasoning_strategies=reasoning_strategies,
+            planning_strategies=planning_strategies,
+            replanning_policies=replanning_policies,
             world_preset=world_preset, world_seed=world_seed,
             enable_gui=enable_gui,
             planner_config=planner_config, use_planner=use_planner,
@@ -196,6 +213,9 @@ if __name__ == "__main__":
                     'agent_presets': agent_presets,
                     'capability_knowledge': capability_knowledge,
                     'comm_strategies': comm_strategies,
+                    'reasoning_strategies': reasoning_strategies,
+                    'planning_strategies': planning_strategies,
+                    'replanning_policies': replanning_policies,
                     'condition': condition,
                     'include_human': include_human,
                     'ticks_per_iteration': ticks_per_iteration,

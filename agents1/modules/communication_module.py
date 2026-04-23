@@ -13,6 +13,7 @@ from concurrent.futures import Future
 from typing import Any, Dict, List, Optional
 from helpers.communication_helpers import _extract_message
 from matrx.messages.message import Message
+from agents1.async_model_prompting import _strip_thinking
 
 logger = logging.getLogger('CommunicationModule')
 
@@ -137,8 +138,8 @@ class CommunicationModule:
         if result is None:
             return  # still in flight
 
-        # Extract text from LLM response
-        text = getattr(result[0], 'content', '') if result else ''
+        # Extract text from LLM response, stripping any <think> blocks
+        text = _strip_thinking(getattr(result[0], 'content', '') if result else '') or ''
         if text:
             self._summary_text = text.strip()
         self._summary_future = None
