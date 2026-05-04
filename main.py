@@ -1,5 +1,6 @@
 import argparse
 import os, requests
+import signal
 import sys
 import json
 import pathlib
@@ -23,7 +24,7 @@ if __name__ == "__main__":
     # ── Deployment ──────────────────────────────────────────────────────────────
     # hpc_mode=True:  headless HPC run (transformers backend, no GUI)
     # hpc_mode=False: local dev    (Ollama backend, browser GUI at localhost:3000)
-    hpc_mode   = True
+    hpc_mode   = False
     enable_gui = not hpc_mode
 
     # ── LLM / Model ─────────────────────────────────────────────────────────────
@@ -46,11 +47,11 @@ if __name__ == "__main__":
     world_seed   = None      # int for reproducibility; None = random each run
 
     # ── Agents ──────────────────────────────────────────────────────────────────
-    num_rescue_agents = args.num_agents if args.num_agents is not None else 2
+    num_rescue_agents = args.num_agents if args.num_agents is not None else 3
 
     # Capability preset per agent; cycles if list is shorter than num_rescue_agents.
     # Options: 'scout', 'medic', 'heavy_lifter', 'generalist', or a custom dict.
-    agent_presets = ['generalist', 'generalist']
+    agent_presets = ['generalist', 'generalist', 'generalist']
 
     # 'informed'  = agents know their capabilities from the start
     # 'discovery' = agents learn their capabilities by failing actions
@@ -58,21 +59,21 @@ if __name__ == "__main__":
 
     # Communication strategy per agent; cycles if shorter than num_rescue_agents.
     # 'always_respond' | 'busy_aware'
-    comm_strategies = ['always_respond', 'always_respond']
+    comm_strategies = ['always_respond', 'always_respond', 'always_respond']
 
     # Reasoning strategy per agent; cycles if shorter than num_rescue_agents.
     # 'io' | 'cot' | 'react' | 'reflexion' | 'self_refine' | 'self_reflective_tot'
-    reasoning_strategies = ['react', 'react']
+    reasoning_strategies = ['react', 'react', 'react']
 
     # Planning strategy per agent; cycles if shorter than num_rescue_agents.
-    # 'io' | 'deps' | 'td' | 'voyager' | 'openagi' | 'hugginggpt'
-    planning_strategies = ['io', 'io']
+    # 'io' | 'deps' | 'td' | 'voyager'
+    planning_strategies = ['io', 'io', 'io']
 
     # Replanning policy per agent; cycles if shorter than num_rescue_agents.
     # 'every_turn'  = run planner on every tick (current behavior)
     # 'critic_gated' = advance DAG on critic success, skip replan on failure,
     #                  only re-decompose when the plan is fully drained
-    replanning_policies = ['every_turn', 'every_turn']
+    replanning_policies = ['every_turn', 'every_turn', 'every_turn']
 
     # ── Planning ─────────────────────────────────────────────────────────────────
     # 'simple' = flat task list; 'dag' = task graph with conditional branching
@@ -115,10 +116,22 @@ if __name__ == "__main__":
     os.makedirs(log_dir, exist_ok=True)
     score_file = os.path.join(log_dir, 'score.json')
 
+    # Write score.json immediately so it always exists even if the run crashes early.
+    with open(score_file, 'w') as f:
+        json.dump({'score': 0, 'block_hit_rate': 0.0, 'victims_rescued': 0, 'total_victims': 0}, f, indent=2)
+
     # Per-agent action CSV log (shared by all agents, written in real-time)
     ActionFileLogger.init(os.path.join(log_dir, 'agent_actions.csv'))
 
     start_time = time.time()
+
+    # Register a SIGTERM handler so HPC scheduler kills (SLURM sends SIGTERM before
+    # SIGKILL) still trigger the finally block and flush metrics to disk.
+    def _sigterm_handler(signum, frame):
+        print("[main] SIGTERM received — flushing metrics before exit.", file=sys.stderr)
+        sys.exit(1)  # raises SystemExit → triggers finally
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     try:
         # Planner config (passed to WorldBuilder which creates the brain)
@@ -193,9 +206,13 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"Failed to save final checkpoint: {e}", file=sys.stderr)
 
-        # Aggregate and save comprehensive metrics
+        # Aggregate and save comprehensive metrics.
+        # aggregate() and save() are separated so the file is always written to disk
+        # even when aggregation only partially succeeds.
+        metrics_path = os.path.join(log_dir, 'simulation_metrics.json')
+        sim_metrics = SimulationMetrics()
+        report: dict = {'partial': True, 'error': None}
         try:
-            sim_metrics = SimulationMetrics()
             it_history = list(planner_brain.iteration_history) if planner_brain and hasattr(planner_brain, 'iteration_history') else []
             report = sim_metrics.aggregate(
                 agents=agents if agents else [],
@@ -223,13 +240,19 @@ if __name__ == "__main__":
                 },
                 iteration_history=it_history,
             )
-            metrics_path = os.path.join(log_dir, 'simulation_metrics.json')
+        except Exception as e:
+            print(f"[main] Metrics aggregation error (will still save partial): {e}", file=sys.stderr)
+            report['error'] = str(e)
+        try:
             sim_metrics.save(metrics_path, report)
             print(f"Saved simulation metrics to {metrics_path}")
+        except Exception as e:
+            print(f"[main] Failed to write simulation_metrics.json: {e}", file=sys.stderr)
 
-            # Enrich score.json with agent-derived metrics
+        # Enrich score.json with agent-derived metrics (best-effort)
+        try:
             perf = report.get('task_performance', {})
-            if os.path.exists(score_file):
+            if perf and os.path.exists(score_file):
                 with open(score_file) as f:
                     score_data = json.load(f)
                 score_data['victims_found'] = perf.get('victims_found', 0)
@@ -238,7 +261,7 @@ if __name__ == "__main__":
                 with open(score_file, 'w') as f:
                     json.dump(score_data, f, indent=2)
         except Exception as e:
-            print(f"[main] Failed to save simulation metrics: {e}", file=sys.stderr)
+            print(f"[main] Failed to enrich score.json: {e}", file=sys.stderr)
 
         # Shut down visualization
         if enable_gui and vis_thread is not None:

@@ -121,18 +121,6 @@ _STRATEGY_ADDENDA: Dict[str, str] = {
         "  2) For each sub-goal give a brief reasoning and the tool to call.\n"
         "Keep the list minimal and executable.\n\n"
     ),
-    'openagi': (
-        "[OpenAGI] You are a planner who is an expert at coming up with a "
-        "concise todo list for the search-and-rescue objective. Ensure the "
-        "list is as short as possible and each item is relevant, effective, "
-        "and described in a single sentence.\n\n"
-    ),
-    'hugginggpt': (
-        "[HuggingGPT] Think step by step about all the tasks needed to "
-        "resolve the mission. Parse out as few tasks as possible while still "
-        "resolving the mission. Pay attention to dependencies and order "
-        "among tasks.\n\n"
-    ),
 }
 
 
@@ -181,21 +169,11 @@ class PlanningVoyager(PlanningBase):
     prefix = _STRATEGY_ADDENDA['voyager']
 
 
-class PlanningOPENAGI(PlanningBase):
-    prefix = _STRATEGY_ADDENDA['openagi']
-
-
-class PlanningHuggingGPT(PlanningBase):
-    prefix = _STRATEGY_ADDENDA['hugginggpt']
-
-
 PLANNING_STRATEGY_REGISTRY: Dict[str, type] = {
     'io':         PlanningIO,
     'deps':       PlanningDEPS,
     'td':         PlanningTD,
     'voyager':    PlanningVoyager,
-    'openagi':    PlanningOPENAGI,
-    'hugginggpt': PlanningHuggingGPT,
 }
 
 

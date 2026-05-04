@@ -44,7 +44,7 @@ from worlds1.environment_info import EnvironmentInformation
 logger = logging.getLogger('SearchRescueAgent')
 
 # How many ticks between proactive status broadcasts even if nothing changed.
-COMM_INTERVAL_TICKS = 15
+COMM_INTERVAL_TICKS = 500
 
 
 # ── Module-level helpers ────────────────────────────────────────────────────
