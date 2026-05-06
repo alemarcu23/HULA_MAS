@@ -19,12 +19,26 @@ if __name__ == "__main__":
                         help="World preset name (e.g. 'static', 'mild_trees', 'random')")
     parser.add_argument('--num_agents', type=int, default=None,
                         help="Number of AI rescue agents (1–5)")
+    parser.add_argument('--agent_presets', type=str, default=None,
+                        help="Comma-separated capability presets, e.g. 'scout,medic,generalist'")
+    parser.add_argument('--agent_roles', type=str, default=None,
+                        help="Comma-separated role hints, e.g. 'scout,medic,generalist'")
+    parser.add_argument('--comm_strategies', type=str, default=None,
+                        help="Comma-separated comm strategies, e.g. 'always_respond,busy_aware'")
+    parser.add_argument('--reasoning_strategies', type=str, default=None,
+                        help="Comma-separated reasoning strategies, e.g. 'react,react'")
+    parser.add_argument('--planning_strategies', type=str, default=None,
+                        help="Comma-separated planning strategies, e.g. 'io,io'")
+    parser.add_argument('--replanning_policies', type=str, default=None,
+                        help="Comma-separated replanning policies, e.g. 'every_turn,critic_gated'")
+    parser.add_argument('--capability_knowledge', type=str, default=None,
+                        help="'informed' or 'discovery'")
     args = parser.parse_args()
 
     # ── Deployment ──────────────────────────────────────────────────────────────
     # hpc_mode=True:  headless HPC run (transformers backend, no GUI)
     # hpc_mode=False: local dev    (Ollama backend, browser GUI at localhost:3000)
-    hpc_mode   = False
+    hpc_mode   = bool(os.environ.get('SAR_MODEL_PATH'))
     enable_gui = not hpc_mode
 
     # ── LLM / Model ─────────────────────────────────────────────────────────────
@@ -53,6 +67,11 @@ if __name__ == "__main__":
     # Options: 'scout', 'medic', 'heavy_lifter', 'generalist', or a custom dict.
     agent_presets = ['generalist', 'generalist', 'generalist']
 
+    # Role hint per agent; injected into the LLM system prompt at startup.
+    # Options: 'scout' | 'medic' | 'heavy_lifter' | 'rescuer' | 'generalist'
+    # Agents are told their role but may adapt if the situation requires.
+    agent_roles = ['generalist', 'generalist', 'generalist']
+
     # 'informed'  = agents know their capabilities from the start
     # 'discovery' = agents learn their capabilities by failing actions
     capability_knowledge = 'informed'
@@ -74,6 +93,22 @@ if __name__ == "__main__":
     # 'critic_gated' = advance DAG on critic success, skip replan on failure,
     #                  only re-decompose when the plan is fully drained
     replanning_policies = ['every_turn', 'every_turn', 'every_turn']
+
+    # ── CLI overrides (applied after defaults so scripts can override cleanly) ──
+    if args.agent_presets:
+        agent_presets = [s.strip() for s in args.agent_presets.split(',')]
+    if args.agent_roles:
+        agent_roles = [s.strip() for s in args.agent_roles.split(',')]
+    if args.comm_strategies:
+        comm_strategies = [s.strip() for s in args.comm_strategies.split(',')]
+    if args.reasoning_strategies:
+        reasoning_strategies = [s.strip() for s in args.reasoning_strategies.split(',')]
+    if args.planning_strategies:
+        planning_strategies = [s.strip() for s in args.planning_strategies.split(',')]
+    if args.replanning_policies:
+        replanning_policies = [s.strip() for s in args.replanning_policies.split(',')]
+    if args.capability_knowledge:
+        capability_knowledge = args.capability_knowledge
 
     # ── Planning ─────────────────────────────────────────────────────────────────
     # 'simple' = flat task list; 'dag' = task graph with conditional branching
@@ -151,7 +186,8 @@ if __name__ == "__main__":
             num_rescue_agents=num_rescue_agents, include_human=include_human,
             api_base=api_base, agent_model=agent_model,
             planning_mode=planning_mode,
-            agent_presets=agent_presets, capability_knowledge=capability_knowledge,
+            agent_presets=agent_presets, agent_roles=agent_roles,
+            capability_knowledge=capability_knowledge,
             comm_strategies=comm_strategies,
             reasoning_strategies=reasoning_strategies,
             planning_strategies=planning_strategies,
@@ -160,6 +196,7 @@ if __name__ == "__main__":
             enable_gui=enable_gui,
             planner_config=planner_config, use_planner=use_planner,
             score_file=score_file,
+            log_dir=log_dir,
         )
 
         # Configure MATRX API port before startup
@@ -228,6 +265,7 @@ if __name__ == "__main__":
                     'world_preset': world_preset,
                     'world_seed': world_seed,
                     'agent_presets': agent_presets,
+                    'agent_roles': agent_roles,
                     'capability_knowledge': capability_knowledge,
                     'comm_strategies': comm_strategies,
                     'reasoning_strategies': reasoning_strategies,

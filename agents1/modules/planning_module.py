@@ -15,6 +15,59 @@ except ImportError:
 
 logger = logging.getLogger('Planning')
 
+CRITIC_PLAN_PROMPT = """
+You are a combined evaluator and task planner for a search-and-rescue agent.
+
+## STEP 1 — Evaluate the last action
+
+Assess whether the last action advanced the current task. Exceeding requirements counts as success.
+
+Special rules:
+- A MoveTo where the target coordinates match the agent's current position is ALWAYS a no-op failure.
+- If there is no last action (last_action is empty or null), skip this step: treat it as success=true, critique="".
+- When the action fails, your critique MUST be actionable: state what went wrong, suggest a specific next action, and note any preconditions to verify first.
+
+Examples:
+INPUT: Position [3,5], Carrying mildly_injured_woman, Last action: CarryObject(object_id="mildly_injured_woman"), Task: Pick up mild victim at [3, 5]
+→ success=true, critique=""
+
+INPUT: Position [5,3], Last action: MoveTo(x=5, y=3), Task: Navigate to victim at [8, 7]
+→ success=false, critique="MoveTo target (5,3) equals current position — no-op. Choose a different destination toward [8, 7]."
+
+INPUT: Position [5,10], Carrying: None, Last action: CarryObjectTogether(object_id="critically_injured_man"), Task: Carry critical victim cooperatively
+→ success=false, critique="CarryObjectTogether failed — check partner_id was provided and teammate is adjacent."
+
+## STEP 2 — Plan the next task
+
+Based on the evaluation above and the world state, output the single best NEXT task for this agent.
+
+Rules:
+- Output exactly ONE single-sentence task.
+- The task must be immediately actionable by this agent.
+- Do NOT output explanations, reasoning, lists, or multiple options.
+- Do NOT assign tasks that are already completed or currently being executed by another agent.
+- Include object IDs, agent IDs, area names, and [x, y] coordinates whenever known.
+- If STEP 1 found a failure, the next task should address or work around that failure.
+- NEVER assign a cooperative task where the only named partner is yourself.
+
+Good examples:
+- "Go to [8, 6] and help rescuebot0 carry victim_3 together."
+- "Deliver victim_2 to the drop zone."
+- "Pick up victim_1 at [2, 5] alone."
+- "Remove the rock blocking Area 2 at [4, 7]."
+- "Explore Area 1."
+
+## Output format
+
+Respond with a single valid JSON object — nothing else:
+{
+  "reasoning": "brief explanation of what the last action did and why",
+  "success": true or false,
+  "critique": "actionable next step if failed, empty string if succeeded",
+  "next_task": "single-sentence next task for this agent"
+}
+"""
+
 TASK_DECOMPOSITION_PROMPT = """
 You are an expert planner for a search and rescue agent.
 Break the given task into 3-7 atomic subtasks. Each subtask must be verifiable as complete or incomplete from a single observation (e.g., "am I at location X?", "am I carrying victim Y?").
@@ -268,13 +321,9 @@ class Planning:
         return desc
 
     def get_planning_prompt(self, information: Dict[str, Any]) -> List[Dict[str, str]]:
-        print("Generating planning prompt with information:", json.dumps(to_toon(information), indent=2, default=str))
-
-        game_rules = information.get('game_rules', '')
-        # Apply strategy decorator, then append game rules (if any)
-        system_content = self.strategy.decorate_system_prompt(PLANNER_PROMPT)
-        if game_rules:
-            system_content = f"{system_content}\n\n{game_rules}"
+        # Use CRITIC_PLAN_PROMPT as the base — it handles both evaluation and planning
+        # in one call. Strategy decorator prepends any strategy-specific prefix.
+        system_content = self.strategy.decorate_system_prompt(CRITIC_PLAN_PROMPT)
 
         messages = [{"role": "system", "content": system_content}]
 

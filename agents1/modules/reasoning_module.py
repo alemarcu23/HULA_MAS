@@ -155,6 +155,7 @@ class ReasoningBase:
         recent_actions = information.get('recent_actions', [])
         game_rules = information.get('game_rules', '')
         agent_capabilities = information.get('agent_capabilities', '')
+        role_prompt = information.get('role_prompt', '')
         tools_available = information.get('tools_available', [])
 
         your_position = observation.get('agent', {}).get('location')
@@ -179,6 +180,8 @@ class ReasoningBase:
             system_parts.append(game_rules)
         if agent_capabilities:
             system_parts.append(f"== YOUR CAPABILITIES ==\n{agent_capabilities}")
+        if role_prompt:
+            system_parts.append(f"== YOUR ROLE ==\n{role_prompt}")
         if tools_available:
             system_parts.append(f"== AVAILABLE TOOLS ==\n" + ', '.join(tools_available))
 
@@ -193,7 +196,6 @@ class ReasoningBase:
             )
             system_content = warning + system_content
 
-        print("Generating reasoning prompt with information:", json.dumps(to_toon(info_dict), indent=2, default=str))
         return [
             {"role": "system", "content": system_content},
             {"role": "user",   "content": to_toon(info_dict)},

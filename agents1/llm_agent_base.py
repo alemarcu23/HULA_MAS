@@ -45,7 +45,7 @@ logger = logging.getLogger('LLMAgentBase')
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-MAX_NR_TOKENS: int = 32768
+MAX_NR_TOKENS: int = 8000
 TEMPERATURE: float = 0.6   # Qwen3 thinking-mode recommended
 TOP_P: float = 0.95
 TOP_K: int = 20
@@ -453,6 +453,9 @@ class LLMAgentBase(ArtificialBrain, Perception):
                 'result': 'delivered',
                 'victim_id': victim_id,
             })
+            ep = getattr(self, 'episode_memory', None)
+            if ep is not None:
+                ep.set_action('CarryObjectTogether_delivered', {'victim_id': victim_id}, self._tick_count)
             if self.shared_memory:
                 # Record the rescue so plan() can report it via _get_rescued_victims().
                 # Use list-append semantics (not overwrite) so concurrent agents don't
@@ -493,6 +496,9 @@ class LLMAgentBase(ArtificialBrain, Perception):
                 'victim_id': self._carry_autopilot['victim_id'],
                 'status': 'delivered',
             })
+            ep = getattr(self, 'episode_memory', None)
+            if ep is not None:
+                ep.set_action('carry_participation', {'victim_id': self._carry_autopilot['victim_id'], 'status': 'delivered'}, self._tick_count)
             self._carry_autopilot = None
             return self._idle()
 
@@ -797,6 +803,12 @@ class LLMAgentBase(ArtificialBrain, Perception):
         if result.valid:
             return None
         self.memory.update("action_failure", result.feedback)
+        ep = getattr(self, 'episode_memory', None)
+        if ep is not None:
+            ep.set_action(name, args, self._tick_count)
+            open_ep = ep.get_open_episode()
+            if open_ep is not None:
+                open_ep.validation_failure = result.feedback
         if self.metrics:
             self.metrics.record_validation_failure(self._tick_count, name, result.feedback)
         return self._idle()

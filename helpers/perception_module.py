@@ -110,11 +110,7 @@ class Perception:
                     self.WORLD_STATE_GLOBAL['victims'].append(
                         {'object_id': obj_id, 'severity': severity, 'location': pos}
                     )
-                    print(
-                        f'[Perception:{getattr(self, "agent_id", "?")}] '
-                        f'NEW victim discovered: {obj_id}  '
-                        f'severity={severity}  at={pos}'
-                    )
+
                 else:
                     existing['location'] = pos
 
@@ -125,10 +121,6 @@ class Perception:
                     self.WORLD_STATE_GLOBAL['obstacles'].append(
                         {'object_id': obj_id, 'type': typ, 'location': pos}
                     )
-                    print(
-                        f'[Perception:{getattr(self, "agent_id", "?")}] '
-                        f'NEW obstacle discovered: {obj_id}  '
-                        f'type={typ}  at={pos}'
-                    )
+
                 else:
                     existing['location'] = pos

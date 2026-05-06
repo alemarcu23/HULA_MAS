@@ -6,15 +6,20 @@ import pathlib
 
 
 def output_logger(fld, log_dir=None):
-    log_base = log_dir if log_dir else os.path.join(fld, 'logs')
-    if not os.path.isdir(log_base):
-        print(f"No logs directory found at {log_base}")
-        return
+    # Prefer log_dir/matrx_actions/ (per-run structure)
+    matrx_dir = os.path.join(log_dir, 'matrx_actions') if log_dir else None
+    if matrx_dir and os.path.isdir(matrx_dir):
+        exp_dirs = [matrx_dir]
+    else:
+        # Fallback: search for exp_*/ siblings (old structure / no log_dir given)
+        log_base = log_dir if log_dir else os.path.join(fld, 'logs')
+        if not os.path.isdir(log_base):
+            print(f"No logs directory found at {log_base}")
+            return
+        exp_dirs = glob.glob(os.path.join(log_base, 'exp_*/'))
 
-    # Find the most recent experiment folder inside logs/
-    exp_dirs = glob.glob(os.path.join(log_base, 'exp_*/'))
     if not exp_dirs:
-        print(f"No experiment folders found in {log_base}")
+        print(f"No experiment folders found")
         return
     recent_dir = max(exp_dirs, key=os.path.getmtime)
 

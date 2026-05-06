@@ -372,10 +372,11 @@ def _completion_transformers(
     mgr = _TransformersModel.get_instance(model)
 
     # Build prompt using Qwen3's chat template (natively supports tools)
+    _enable_thinking = os.environ.get("LLM_ENABLE_THINKING", "1") != "0"
     template_kwargs = {
         "tokenize": False,
         "add_generation_prompt": True,
-        "enable_thinking": True,
+        "enable_thinking": _enable_thinking,
     }
     if tools:
         template_kwargs["tools"] = tools
@@ -590,7 +591,7 @@ def call_llm_sync(
     llm_model: str,
     system_prompt: str,
     user_prompt: str,
-    max_token_num: int = 32768,
+    max_token_num: int = 3000,
     temperature: float = 0.7,
     top_p: float = 0.8,
     top_k: int = 20,

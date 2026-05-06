@@ -66,7 +66,7 @@ def _compute_agent_starts(drop_zone_loc, grid_width):
 def add_agents(builder, condition, name, folder, agent_type='baseline',
                num_rescue_agents=1, include_human=True,
                api_base="http://localhost:11434", agent_model='qwen3:8b',
-               planning_mode='simple', agent_presets=None,
+               planning_mode='simple', agent_presets=None, agent_roles=None,
                capability_knowledge='informed', comm_strategies=None,
                reasoning_strategies=None, planning_strategies=None,
                replanning_policies=None,
@@ -87,15 +87,21 @@ def add_agents(builder, condition, name, folder, agent_type='baseline',
         planning_mode: Planning strategy for agents ('simple' or 'dag')
         agent_presets: List of preset names or capability dicts, one per agent.
                        Defaults to all 'generalist'.
+        agent_roles: List of role hints, one per agent (e.g. 'scout', 'medic').
+                     Injected into the LLM system prompt; agents may adapt.
         capability_knowledge: 'informed' (agents know capabilities) or 'discovery'
                               (agents learn from failures).
         agent_starts: List of (x,y) start positions for agents.
     """
     if agent_presets is None:
         agent_presets = [DEFAULT_PRESET] * num_rescue_agents
-    # Extend or truncate to match num_rescue_agents
     while len(agent_presets) < num_rescue_agents:
         agent_presets.append(agent_presets[-1] if agent_presets else DEFAULT_PRESET)
+
+    if agent_roles is None:
+        agent_roles = ['generalist'] * num_rescue_agents
+    while len(agent_roles) < num_rescue_agents:
+        agent_roles.append(agent_roles[-1] if agent_roles else 'generalist')
 
     if comm_strategies is None:
         comm_strategies = ['always_respond'] * num_rescue_agents
@@ -161,9 +167,10 @@ def add_agents(builder, condition, name, folder, agent_type='baseline',
                     comm_strategy=comm_strategies[agent_nr],
                     env_info=env_info,
                     use_planner=use_planner,
+                    initial_role=agent_roles[agent_nr],
                 )
                 agents.append(brain)
-                print(f"[WorldBuilder] Using Agent '{agent_name}' (SearchRescueAgent, caps={caps})")
+                print(f"[WorldBuilder] Using Agent '{agent_name}' (SearchRescueAgent, caps={caps}, role={agent_roles[agent_nr]})")
 
             loc = agent_starts[agent_nr % len(agent_starts)]
             builder.add_agent(loc, brain, team=team_name, name=agent_name,
@@ -244,12 +251,13 @@ def _apply_auto_decorations(builder, preset):
 def create_builder(condition, name, folder, agent_type='baseline',
                    num_rescue_agents=1, include_human=True,
                    api_base="http://localhost:11434", agent_model='qwen3:8b',
-                   planning_mode='simple', agent_presets=None,
+                   planning_mode='simple', agent_presets=None, agent_roles=None,
                    capability_knowledge='informed', comm_strategies=None,
                    reasoning_strategies=None, planning_strategies=None,
                    replanning_policies=None,
                    world_preset='static', world_seed=None, enable_gui=True,
-                   planner_config=None, use_planner=True, score_file=None):
+                   planner_config=None, use_planner=True, score_file=None,
+                   log_dir=None):
     # Set numpy's random generator
     np.random.seed(random_seed)
 
@@ -283,9 +291,12 @@ def create_builder(condition, name, folder, agent_type='baseline',
     )
 
     # Create folders where the logs are stored during the official condition
-    log_base = os.environ.get('SAR_LOG_DIR', os.path.join(os.getcwd(), 'logs'))
-    current_exp_folder = datetime.now().strftime("exp_"+condition+"_at_time_%Hh-%Mm-%Ss_date_%dd-%mm-%Yy")
-    logger_save_folder = os.path.join(log_base, current_exp_folder)
+    if log_dir is not None:
+        logger_save_folder = os.path.join(log_dir, 'matrx_actions')
+    else:
+        log_base = os.environ.get('SAR_LOG_DIR', os.path.join(os.getcwd(), 'logs'))
+        current_exp_folder = datetime.now().strftime("exp_"+condition+"_at_time_%Hh-%Mm-%Ss_date_%dd-%mm-%Yy")
+        logger_save_folder = os.path.join(log_base, current_exp_folder)
     builder.add_logger(ActionLogger, log_strategy=1, save_path=logger_save_folder, file_name_prefix="actions_")
 
     # World bounds
@@ -378,7 +389,7 @@ def create_builder(condition, name, folder, agent_type='baseline',
                         num_rescue_agents=num_rescue_agents, include_human=include_human,
                         api_base=api_base, agent_model=agent_model,
                         planning_mode=planning_mode,
-                        agent_presets=agent_presets,
+                        agent_presets=agent_presets, agent_roles=agent_roles,
                         capability_knowledge=capability_knowledge,
                         comm_strategies=comm_strategies,
                         reasoning_strategies=reasoning_strategies,

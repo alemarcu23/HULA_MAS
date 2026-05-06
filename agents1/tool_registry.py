@@ -204,9 +204,9 @@ def SendMessage(message: str, send_to: str, message_type: str = "message"):
 
 
 # Ordered list of every action tool — used to build the registry + LLM schemas.
+# MoveNorth/South/East/West removed: MoveTo with A* is always preferable.
 ALL_ACTION_TOOLS = [
-    MoveNorth, MoveSouth, MoveEast, MoveWest,
-    MoveTo, NavigateToDropZone, MoveToArea, SearchArea,
+    MoveTo, MoveToArea, NavigateToDropZone, SearchArea,
     CarryObject, CarryObjectTogether,
     Drop,
     RemoveObject, RemoveObjectTogether, SendMessage
