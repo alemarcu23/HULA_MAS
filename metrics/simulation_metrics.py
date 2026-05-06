@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+from itertools import combinations
 from typing import Any, Dict, List, Optional
 
 _THINK_RE = re.compile(r'<think>.*?</think>', re.DOTALL)
@@ -98,6 +99,11 @@ class SimulationMetrics:
                     all_victims_found.add(v['victim_id'])
         result['task_performance']['victims_found'] = len(all_victims_found)
 
+        completion_ticks = max(
+            (getattr(a, '_tick_count', 0) for a in agent_list), default=0
+        )
+        result['task_performance']['completion_ticks'] = completion_ticks
+
         # ── Spatial coordination ─────────────────────────────────────────
         per_agent_cells: Dict[str, set] = {}
         per_agent_areas: Dict[str, List] = {}
@@ -111,18 +117,25 @@ class SimulationMetrics:
 
         all_cells = [c for c in per_agent_cells.values()]
         union_cells = set().union(*all_cells) if all_cells else set()
-        if len(all_cells) >= 2:
-            overlap = set.intersection(*all_cells)
-        else:
-            overlap = set()
+        total_visits = sum(len(c) for c in all_cells)
+        # Redundant visits = total individual visits minus unique cells visited.
+        # This correctly captures any pairwise or higher-order overlap, unlike
+        # N-way set intersection which is zero whenever any agent didn't visit a cell.
+        redundant_visits = total_visits - len(union_cells)
+
+        pairwise_overlap = {
+            f'{a}___{b}': len(per_agent_cells[a] & per_agent_cells[b])
+            for a, b in combinations(sorted(per_agent_cells), 2)
+        }
 
         result['spatial_coordination'] = {
             'areas_covered_per_agent': {
                 aid: summaries for aid, summaries in per_agent_areas.items()
             },
             'total_unique_cells': len(union_cells),
-            'overlap_cells_count': len(overlap),
-            'overlap_ratio': round(len(overlap) / len(union_cells), 3) if union_cells else 0.0,
+            'redundant_visits': redundant_visits,
+            'overlap_ratio': round(redundant_visits / total_visits, 3) if total_visits else 0.0,
+            'pairwise_overlap': pairwise_overlap,
             'per_agent_unique_cells': {
                 aid: len(cells) for aid, cells in per_agent_cells.items()
             },
@@ -183,10 +196,28 @@ class SimulationMetrics:
                 'responses_sent': tracker.help_responses_sent,
             }
 
+        _ACCEPT_KW = {'accept', 'will help', 'on my way', 'heading', 'coming', 'assist', 'yes'}
+        _REFUSE_KW = {'cannot', "can't", 'unable', 'busy', 'occupied', 'not able', 'no'}
+        help_accepted = 0
+        help_refused = 0
+        for agent in agent_list:
+            tracker = self._get_tracker(agent)
+            if not tracker:
+                continue
+            for m in tracker.messages_sent:
+                if m.get('message_type') == 'help':
+                    text_lower = m.get('text', '').lower()
+                    if any(kw in text_lower for kw in _ACCEPT_KW):
+                        help_accepted += 1
+                    elif any(kw in text_lower for kw in _REFUSE_KW):
+                        help_refused += 1
+
         result['help_seeking'] = {
             'total_help_requests': total_help,
             'per_agent': help_per_agent,
             'help_response_rate': round(total_responses / total_help, 3) if total_help else 0.0,
+            'help_accepted': help_accepted,
+            'help_refused': help_refused,
         }
 
         # ── Agent efficiency ─────────────────────────────────────────────

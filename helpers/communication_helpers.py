@@ -1,7 +1,7 @@
 from typing import Optional
 
 
-VALID_MESSAGE_TYPES = frozenset({'ask_help', 'help', 'message'})
+VALID_MESSAGE_TYPES = frozenset({'ask_help', 'help', 'message', 'plan_update'})
 
 
 def _extract_message(msg, agent_id) -> Optional[dict]:

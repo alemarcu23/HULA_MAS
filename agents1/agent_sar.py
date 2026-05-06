@@ -163,6 +163,9 @@ class SearchRescueAgent(LLMAgentBase):
         # Cursor into CommunicationModule.all_messages_raw so we only save new
         # messages each tick without duplicating entries already in memory.
         self._comm_msg_cursor: int = 0
+        # Separate cursor advanced only when a new episode opens, so each
+        # episode captures exactly the messages received since the last episode.
+        self._episode_msg_cursor: int = 0
 
         # Communication throttle state
         self._last_comm_tick: int = -1
@@ -337,8 +340,12 @@ class SearchRescueAgent(LLMAgentBase):
             role=self._current_role or 'unassigned',
         )
 
-        # Snapshot peer messages received since the last episode opened
-        new_msgs = list(self.communication.all_messages_raw)[self._comm_msg_cursor:]
+        # Snapshot peer messages received since the last episode opened.
+        # Uses _episode_msg_cursor (not _comm_msg_cursor) because _comm_msg_cursor
+        # is advanced every tick before _advance_pipeline is called.
+        all_msgs = list(self.communication.all_messages_raw)
+        new_msgs = all_msgs[self._episode_msg_cursor:]
+        self._episode_msg_cursor = len(all_msgs)
         self.episode_memory.set_received_messages([
             {
                 'from': m.get('from'),
