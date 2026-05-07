@@ -11,8 +11,12 @@ except ImportError:
 
 logger = logging.getLogger('Planning')
 
-CRITIC_PLAN_PROMPT = """
-You are a combined evaluator and task planner for a search-and-rescue agent.
+SYSTEM_ROLE_PROMPT = (
+    "You are a combined evaluator and task planner for a search-and-rescue agent. "
+    "Follow the instructions in the user message exactly."
+)
+
+PLANNING_INSTRUCTIONS = """
 ## STEP 1: EVALUATE LAST ACTION
 Assess whether the `last_action` advanced the goal.
 *   SUCCESS: The action achieved or exceeded its intent. (Note: If `last_action` is empty or null, treat it as a success).
@@ -32,7 +36,7 @@ OUT: success=false, critique="CarryObjectTogether failed — check that teammate
 
 ## STEP 2: PLAN NEXT TASK
 
-Your `high_level_task` is the mission assigned to you by the coordination round (e.g. "Search area 3 for victims", "Rescue mildly_injured_woman at [4,7]"). Use the `past_subtask` and `high_level_task` together to decide the single best NEXT atomic step to execute right now.
+Your `high_level_task` is the mission assigned to you by the coordination round (e.g. "Search area 3 for victims", "Rescue mildly_injured_woman at [4,7]"). Use the last planned sub-task and `high_level_task` together to decide the single best NEXT atomic step to execute right now.
 
 If `high_level_task` is empty, choose the most valuable action given the world state and your role.
 
@@ -44,23 +48,22 @@ You are free to ignore your role for the next task, but you should choose action
 Rules:
 - Do NOT assign tasks that are already completed or currently being executed by another agent.
 - Include object IDs, agent IDs, area names, and [x, y] coordinates whenever known.
-- Victims listed in history.rescued_victims are already safe — NEVER plan to rescue, carry, or interact with them.
-- If the same task appears 3 or more times in history.previous_tasks without progress, switch to a completely different task: explore a new room or area not yet covered (use history.area_coverage to find uncovered areas).
+- Victims listed in HISTORY > rescued_victims are already safe — NEVER plan to rescue, carry, or interact with them.
+- If the same task appears 3 or more times in HISTORY > previous_tasks without progress, switch to a completely different task: explore a new room or area not yet covered (use HISTORY > area_coverage to find uncovered areas).
 - Output exactly ONE next_task — a single atomic step, not a list or multi-step plan.
+- Do NOT repeat a task that a teammate already has as their current_plan (see TEAM section).
 
 ## INPUT DATA REFERENCE
-*   `Your name is ...`: Your agent identity, role, capabilities, position, and what you are carrying.
-*   `Your last action was ...`: The action you just executed and the task it aimed to complete (this is your current executing task).
-*   `high-level assignment`: The mission assigned to you by the coordination round. Break it into atomic steps; `next_task` should be the very next step toward completing it.
-*   `past_subtask`: The sub-task you were working on during the previous planning cycle. Use this as context for what has already been attempted or completed.
-*   `last_task` (in history entries): The task that was active at that tick.
-*   `planned_task` (in history entries): The next task that was planned during that tick.
-*   `previous_tasks`: Your recent history (avoid repeating past tasks).
-*   `observation` / `all_discovered`: Known map states.
-*   `rescued_victims`: Victims already saved (do not re-rescue).
-*   `area_coverage`: Coverage % per area (prioritize lowest coverage areas).
+*   `YOU`: Your identity, role, capabilities, position, and what you are carrying.
+*   `CURRENT WORK`: Your high-level assignment, the last sub-task you were executing, and the last action you took.
+*   `TEAM`: Your teammates — their positions, roles, and current plans. Coordinate to avoid duplication.
+*   `WORLD STATE`: Current observations and all discovered objects.
+*   `HISTORY > previous_tasks`: Your recent planning history (last_task / planned_task / action / outcome). Avoid repeating past failures.
+*   `HISTORY > rescued_victims`: Victims already delivered to the drop zone — never re-rescue these.
+*   `HISTORY > area_coverage`: Coverage % per area — prioritize lowest coverage when exploring.
+*   `MESSAGES`: Recent inter-agent messages including help requests and coordination.
 
-Good examples:
+Good examples of next_task:
 - "Respond to rescuebot0's message to carry victim_3 together by replying to the message."
 - "Deliver victim_2 to the drop zone."
 - "Pick up victim_1 at [2, 5] alone."
@@ -77,6 +80,9 @@ Respond with a single valid JSON object — nothing else:
   "next_task": "single-sentence next task for this agent that is immediately actionable and addresses any critique if failed"
 }
 """
+
+# Keep backward-compat alias so any external code referencing CRITIC_PLAN_PROMPT still works.
+CRITIC_PLAN_PROMPT = SYSTEM_ROLE_PROMPT + "\n" + PLANNING_INSTRUCTIONS
 
 
 # ── Strategy-specific prompt addenda ────────────────────────────────────────
@@ -160,20 +166,20 @@ def _format_planning_user_content(information: Dict[str, Any]) -> str:
     carrying = ctx.get('carrying', 'nothing')
     teammates = ctx.get('teammates', [])
 
-    current_task = information.get('current_task', '')
-    high_level_task = information.get('high_level_task', '')
-    past_subtask = information.get('past_subtask', '') or 'none'
+    current_task = information.get('current_task', '') or 'none'
+    high_level_task = information.get('high_level_task', '') or 'none'
 
     last_action = information.get('last_action') or {}
     last_action_name = last_action.get('name', '') if isinstance(last_action, dict) else ''
-    # args may be nested under 'args' key or flat at the top level
-    raw_args = last_action.get('args') if isinstance(last_action, dict) and 'args' in last_action else {
-        k: v for k, v in last_action.items() if k != 'name'
-    } if isinstance(last_action, dict) else {}
+    raw_args = (
+        last_action.get('args')
+        if isinstance(last_action, dict) and 'args' in last_action
+        else {k: v for k, v in last_action.items() if k != 'name'}
+        if isinstance(last_action, dict)
+        else {}
+    )
     args_str = ', '.join(f'{k}={v}' for k, v in raw_args.items()) if raw_args else ''
     last_action_str = f'{last_action_name}({args_str})' if last_action_name else 'none'
-
-    teammates_str = to_toon(teammates) if teammates else 'none'
 
     history = information.get('history', {})
     previous_tasks_raw = history.get('previous_tasks') or []
@@ -189,19 +195,11 @@ def _format_planning_user_content(information: Dict[str, Any]) -> str:
         for ep in previous_tasks_raw
     ]
 
-    world = {
-        'observation': information.get('observation', {}),
-        'all_discovered': information.get('all_discovered', {}),
-        'history': {
-            'previous_tasks': previous_tasks,
-            'rescued_victims': history.get('rescued_victims'),
-            'messages': history.get('messages'),
-            'area_coverage': history.get('area_coverage'),
-        },
-    }
+    messages = history.get('messages')
 
     lines = []
 
+    # ── URGENT blocks (always first) ────────────────────────────────────────
     urgent_help = information.get('urgent_help_request')
     if urgent_help:
         from_agent = urgent_help.get('from', 'teammate')
@@ -210,11 +208,11 @@ def _format_planning_user_content(information: Dict[str, Any]) -> str:
             "== URGENT: INCOMING HELP REQUEST ==",
             f'{from_agent} asks: "{req_text}"',
             "You MUST respond this tick by calling SendMessage with:",
-            f'    message="yes" or "no" (exact lowercase word, no extra text)',
+            '    message="yes" or "no" (exact lowercase word, no extra text)',
             f'    send_to="{from_agent}"',
             '    message_type="help"',
             'Saying "yes" commits you to auto-navigate to the victim.',
-            "Say \"no\" if you're busy or already committed to a higher-priority task.",
+            'Say "no" if you\'re busy or already committed to a higher-priority task.',
             "====================================",
             "",
         ])
@@ -228,22 +226,68 @@ def _format_planning_user_content(information: Dict[str, Any]) -> str:
             "",
         ])
 
+    # ── YOU ──────────────────────────────────────────────────────────────────
     lines.extend([
-        f"Your name is {agent} with the role {role} and the following capabilities:",
+        "== YOU ==",
+        f"Name: {agent}",
+        f"Role: {role}",
+        "Capabilities:",
         capabilities,
+        f"Position: {position}",
+        f"Carrying: {carrying}",
         "",
-        f"You are currently at position {position}. Carrying: {carrying}.",
-        f"Your last action was {last_action_str} which aimed to complete the current task: \"{current_task}\".",
-        "",
-        "---",
-        "",
-        f"Your previous sub-task was: \"{past_subtask}\"",
-        f"Your current high-level assignment is: \"{high_level_task}\"",
-        f"Your teammates are: {teammates_str}",
-        "",
-        "== WORLD KNOWLEDGE ==",
-        to_toon(world),
     ])
+
+    # ── CURRENT WORK ─────────────────────────────────────────────────────────
+    lines.extend([
+        "== CURRENT WORK ==",
+        f"High-level assignment: \"{high_level_task}\"",
+        f"Last planned sub-task (what the last action tried to complete): \"{current_task}\"",
+        f"Last action: {last_action_str}",
+        "",
+    ])
+
+    # ── TEAM ─────────────────────────────────────────────────────────────────
+    lines.extend([
+        "== TEAM ==",
+        to_toon(teammates) if teammates else "none",
+        "",
+    ])
+
+    # ── INSTRUCTIONS ─────────────────────────────────────────────────────────
+    lines.extend([
+        "== YOUR TASK NOW ==",
+        PLANNING_INSTRUCTIONS.strip(),
+        "",
+    ])
+
+    # ── WORLD STATE ──────────────────────────────────────────────────────────
+    lines.extend([
+        "== WORLD STATE ==",
+        to_toon({
+            'observation': information.get('observation', {}),
+            'all_discovered': information.get('all_discovered', {}),
+        }),
+        "",
+    ])
+
+    # ── HISTORY ──────────────────────────────────────────────────────────────
+    lines.extend([
+        "== HISTORY ==",
+        to_toon({
+            'previous_tasks': previous_tasks,
+            'rescued_victims': history.get('rescued_victims'),
+            'area_coverage': history.get('area_coverage'),
+        }),
+        "",
+    ])
+
+    # ── MESSAGES ─────────────────────────────────────────────────────────────
+    lines.extend([
+        "== MESSAGES ==",
+        to_toon(messages) if messages else "none",
+    ])
+
     return '\n'.join(lines)
 
 
@@ -258,9 +302,7 @@ class Planning:
         self.current_task = task
 
     def get_planning_prompt(self, information: Dict[str, Any]) -> List[Dict[str, str]]:
-        # Use CRITIC_PLAN_PROMPT as the base — it handles both evaluation and planning
-        # in one call. Strategy decorator prepends any strategy-specific prefix.
-        system_content = self.strategy.decorate_system_prompt(CRITIC_PLAN_PROMPT)
+        system_content = self.strategy.decorate_system_prompt(SYSTEM_ROLE_PROMPT)
 
         messages = [{"role": "system", "content": system_content}]
 

@@ -195,7 +195,8 @@ class SearchRescueAgent(LLMAgentBase):
 
         # Role system — seed from hardcoded initial_role if provided
         self._current_role: str = initial_role or ''
-        self._team_roles: Dict[str, str] = {}  # {agent_id: role} from incoming messages
+        self._team_roles: Dict[str, str] = {}   # {agent_id: role} from incoming messages
+        self._team_plans: Dict[str, str] = {}   # {agent_id: next_task} from plan_update messages
 
         # Anti-loop detection: track last 3 executed actions
         self._recent_actions: deque = deque(maxlen=3)
@@ -255,6 +256,12 @@ class SearchRescueAgent(LLMAgentBase):
                 role   = content.get('role', '')
                 if sender and sender != self.agent_id and role:
                     self._team_roles[sender] = role
+
+            if isinstance(content, dict) and content.get('message_type') == 'plan_update':
+                sender = getattr(msg, 'from_id', '')
+                task = content.get('task', '')
+                if sender and sender != self.agent_id and task:
+                    self._team_plans[sender] = task
 
         # Register this agent so the coordinator can build a complete team list
         # even before all agents are within perception range of each other.
@@ -966,12 +973,13 @@ class SearchRescueAgent(LLMAgentBase):
         agent_info = self.WORLD_STATE.get('agent', {})
         common_ctx = self._build_common_context()
 
-        # Enrich teammate list with known roles
+        # Enrich teammate list with known roles and current plans
         teammates_enriched = [
             {
                 'id': t['object_id'],
                 'location': [t.get('x'), t.get('y')],
                 'role': self._team_roles.get(t['object_id'], 'unknown'),
+                'current_plan': self._team_plans.get(t['object_id'], ''),
             }
             for t in self.WORLD_STATE.get('teammates', [])
         ]
@@ -1036,10 +1044,14 @@ class SearchRescueAgent(LLMAgentBase):
             'urgent_abandon': urgent_abandon,
         }
 
+        print(
+            f'[{self.agent_id}] PLAN inputs (tick {self._tick_count}):\n'
+            + json.dumps(planning_inputs, default=str, indent=2)
+        )
+
         planning_inputs['history']['area_coverage'] = self.area_tracker.get_all_summaries()
 
         prompt = self.planner.get_planning_prompt(planning_inputs)
-        print(prompt)
         self.call_llm(prompt)
         return self._idle()
 
@@ -1093,7 +1105,7 @@ class SearchRescueAgent(LLMAgentBase):
                 f"last_outcome={'ok' if last_ok else 'fail'}"
             )
             self.send_message(Message(
-                content={'message_type': 'plan_update', 'text': summary},
+                content={'message_type': 'plan_update', 'text': summary, 'task': task},
                 from_id=self.agent_id,
                 to_id=None,
             ))
