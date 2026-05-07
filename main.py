@@ -4,6 +4,7 @@ import signal
 import sys
 import json
 import pathlib
+import threading
 import time
 from worlds1.WorldBuilder import create_builder
 from loggers.OutputLogger import output_logger
@@ -160,6 +161,29 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
+    metrics_path = os.path.join(log_dir, 'simulation_metrics.json')
+    _metrics_config = {
+        'agent_type': agent_type,
+        'num_rescue_agents': num_rescue_agents,
+        'planning_mode': planning_mode,
+        'planner_model': planner_model,
+        'agent_model': agent_model,
+        'world_preset': world_preset,
+        'world_seed': world_seed,
+        'agent_presets': agent_presets,
+        'agent_roles': agent_roles,
+        'capability_knowledge': capability_knowledge,
+        'comm_strategies': comm_strategies,
+        'reasoning_strategies': reasoning_strategies,
+        'planning_strategies': planning_strategies,
+        'replanning_policies': replanning_policies,
+        'condition': condition,
+        'include_human': include_human,
+        'ticks_per_iteration': ticks_per_iteration,
+        'use_planner': use_planner,
+    }
+    sim_metrics = SimulationMetrics()
+
     # Register a SIGTERM handler so HPC scheduler kills (SLURM sends SIGTERM before
     # SIGKILL) still trigger the finally block and flush metrics to disk.
     def _sigterm_handler(signum, frame):
@@ -167,6 +191,42 @@ if __name__ == "__main__":
         sys.exit(1)  # raises SystemExit → triggers finally
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    # Background thread: saves simulation_metrics.json every 60 s and prints a summary
+    # to stdout (SLURM captures stdout in .out log, so data survives SIGKILL).
+    _stop_metrics_thread = threading.Event()
+
+    def _run_periodic_metrics_save():
+        while not _stop_metrics_thread.wait(timeout=60):
+            try:
+                it_hist = (list(planner_brain.iteration_history)
+                           if planner_brain and hasattr(planner_brain, 'iteration_history')
+                           else [])
+                report = sim_metrics.aggregate(
+                    agents=agents if agents else [],
+                    planner=planner_brain,
+                    score_file=score_file,
+                    start_time=start_time,
+                    config=_metrics_config,
+                    iteration_history=it_hist,
+                )
+                sim_metrics.save(metrics_path, report)
+                perf = report.get('task_performance', {})
+                print(
+                    f"[metrics] score={perf.get('score', 0)} "
+                    f"rescued={perf.get('victims_rescued', 0)}/{perf.get('total_victims', 0)} "
+                    f"found={perf.get('victims_found', 0)} "
+                    f"cells={perf.get('cells_explored', 0)} "
+                    f"obstacles_removed={perf.get('obstacles_removed', 0)}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[metrics_thread] {e}", file=sys.stderr, flush=True)
+
+    _metrics_thread = threading.Thread(
+        target=_run_periodic_metrics_save, daemon=True, name="metrics-saver"
+    )
+    _metrics_thread.start()
 
     try:
         # Planner config (passed to WorldBuilder which creates the brain)
@@ -235,6 +295,10 @@ if __name__ == "__main__":
         print(f"[main] Simulation error: {e}", file=sys.stderr)
 
     finally:
+        # Stop the periodic metrics thread and wait briefly before the final save.
+        _stop_metrics_thread.set()
+        _metrics_thread.join(timeout=5)
+
         # Save final iteration history (planner also checkpoints every 1000 ticks)
         if planner_brain is not None and hasattr(planner_brain, '_save_checkpoint'):
             try:
@@ -246,36 +310,17 @@ if __name__ == "__main__":
         # Aggregate and save comprehensive metrics.
         # aggregate() and save() are separated so the file is always written to disk
         # even when aggregation only partially succeeds.
-        metrics_path = os.path.join(log_dir, 'simulation_metrics.json')
-        sim_metrics = SimulationMetrics()
         report: dict = {'partial': True, 'error': None}
         try:
-            it_history = list(planner_brain.iteration_history) if planner_brain and hasattr(planner_brain, 'iteration_history') else []
+            it_history = (list(planner_brain.iteration_history)
+                          if planner_brain and hasattr(planner_brain, 'iteration_history')
+                          else [])
             report = sim_metrics.aggregate(
                 agents=agents if agents else [],
                 planner=planner_brain,
                 score_file=score_file,
                 start_time=start_time,
-                config={
-                    'agent_type': agent_type,
-                    'num_rescue_agents': num_rescue_agents,
-                    'planning_mode': planning_mode,
-                    'planner_model': planner_model,
-                    'agent_model': agent_model,
-                    'world_preset': world_preset,
-                    'world_seed': world_seed,
-                    'agent_presets': agent_presets,
-                    'agent_roles': agent_roles,
-                    'capability_knowledge': capability_knowledge,
-                    'comm_strategies': comm_strategies,
-                    'reasoning_strategies': reasoning_strategies,
-                    'planning_strategies': planning_strategies,
-                    'replanning_policies': replanning_policies,
-                    'condition': condition,
-                    'include_human': include_human,
-                    'ticks_per_iteration': ticks_per_iteration,
-                    'use_planner': use_planner,
-                },
+                config=_metrics_config,
                 iteration_history=it_history,
             )
         except Exception as e:
@@ -283,7 +328,8 @@ if __name__ == "__main__":
             report['error'] = str(e)
         try:
             sim_metrics.save(metrics_path, report)
-            print(f"Saved simulation metrics to {metrics_path}")
+            print(f"Saved simulation metrics to {metrics_path}", flush=True)
+            print("[metrics-final]", json.dumps(report, indent=2, default=str), flush=True)
         except Exception as e:
             print(f"[main] Failed to write simulation_metrics.json: {e}", file=sys.stderr)
 

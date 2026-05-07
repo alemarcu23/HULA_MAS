@@ -420,6 +420,7 @@ class LLMAgentBase(ArtificialBrain, Perception):
                 'victim_id': obj_id,
                 'destination': dest,
                 'role': 'carrier',
+                'partner': self._coop_carry_partner_id,
             }
             if self.shared_memory:
                 self.shared_memory.update(SM_CARRY_AUTOPILOT, {
@@ -467,6 +468,7 @@ class LLMAgentBase(ArtificialBrain, Perception):
                         'victim_id': victim_id,
                         'tick': self._tick_count,
                         'agent': self.agent_id,
+                        'partner': self._carry_autopilot.get('partner'),
                         'method': 'cooperative',
                     }]
                     self.shared_memory.update('rescued_victims', rescued)

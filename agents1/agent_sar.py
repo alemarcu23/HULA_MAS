@@ -47,7 +47,6 @@ logger = logging.getLogger('SearchRescueAgent')
 COMM_INTERVAL_TICKS = 500
 
 # ── Role system ────────────────────────────────────────────────────────────────
-ROLE_MIN_DURATION_TICKS = 1500
 ROLE_CLAIM_MSG_TYPE = 'role_claim'  # message_type used for role announcements
 
 
@@ -174,7 +173,6 @@ class SearchRescueAgent(LLMAgentBase):
 
         # Role system — seed from hardcoded initial_role if provided
         self._current_role: str = initial_role or ''
-        self._role_assigned_tick: int = 0
         self._team_roles: Dict[str, str] = {}  # {agent_id: role} from incoming messages
 
         # Anti-loop detection: track last 3 executed actions
@@ -222,8 +220,14 @@ class SearchRescueAgent(LLMAgentBase):
         super().update_knowledge(filtered_state)
 
         # Parse role_claim messages from peers and update local team-role map.
+        # MATRX may deliver content as a JSON string; handle both dict and str forms.
         for msg in self.received_messages:
             content = msg.content if hasattr(msg, 'content') else {}
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except (json.JSONDecodeError, ValueError):
+                    content = {}
             if isinstance(content, dict) and content.get('message_type') == ROLE_CLAIM_MSG_TYPE:
                 sender = getattr(msg, 'from_id', '')
                 role   = content.get('role', '')
@@ -357,7 +361,7 @@ class SearchRescueAgent(LLMAgentBase):
 
     def _advance_pipeline(self) -> Tuple[Optional[str], Dict]:
         if self._pipeline_stage == PipelineStage.IDLE:
-            self._get_or_assign_role()  # re-evaluate role each cycle; no-op when stable
+            self._get_or_assign_role()  # assign role on first cycle only
             self._is_first_cycle = False
             self._pipeline_context = {}
             self._open_episode_cycle()
@@ -451,42 +455,24 @@ class SearchRescueAgent(LLMAgentBase):
             return 'heavy'
         return 'rescuer'  # safe default
 
-    def _should_switch_role(self) -> bool:
-        """Return True when a role change is warranted and the min duration has elapsed."""
-        if self._tick_count - self._role_assigned_tick < ROLE_MIN_DURATION_TICKS:
-            return False
-        unrescued  = self.WORLD_STATE_GLOBAL.get('victims', [])
-        obstacles  = self.WORLD_STATE_GLOBAL.get('obstacles', [])
-        unexplored = [s for s in self.area_tracker.get_all_summaries()
-                      if s['status'] != 'complete']
-        if self._current_role == 'scout'   and not unexplored and unrescued:
-            return True
-        if self._current_role == 'rescuer' and not unrescued   and unexplored:
-            return True
-        if self._current_role == 'heavy'   and not obstacles   and unrescued:
-            return True
-        return False
-
     def _get_or_assign_role(self) -> str:
-        """Read team roles from message history; (re)assign own role if needed.
+        """Assign agent's role on first cycle; keep it for the rest of execution.
 
-        Sends a direct role_claim broadcast — no LLM, no extra tick cost.
+        Sends a direct role_claim broadcast on first assignment — no LLM, no extra tick cost.
         """
-        needs_assign = not self._current_role or self._should_switch_role()
-        if not needs_assign:
+        if self._current_role:
             return self._current_role
 
         new_role = self._pick_role()
-        if new_role != self._current_role:
-            self._current_role      = new_role
-            self._role_assigned_tick = self._tick_count
-            # Announce to teammates — pure send_message, no LLM
-            self.send_message(Message(
-                content={'message_type': ROLE_CLAIM_MSG_TYPE, 'role': new_role},
-                from_id=self.agent_id,
-                to_id=None,  # broadcast
-            ))
-            print(f'[{self.agent_id}] Role → {new_role} (tick={self._tick_count})')
+        self._current_role = new_role
+        self._role_assigned_tick = self._tick_count
+        # Announce to teammates — pure send_message, no LLM
+        self.send_message(Message(
+            content={'message_type': ROLE_CLAIM_MSG_TYPE, 'role': new_role},
+            from_id=self.agent_id,
+            to_id=None,  # broadcast
+        ))
+        print(f'[{self.agent_id}] Role → {new_role} (tick={self._tick_count})')
         return self._current_role
 
     def _get_role_hint(self) -> str:
@@ -739,10 +725,11 @@ class SearchRescueAgent(LLMAgentBase):
             for t in self.WORLD_STATE.get('teammates', [])
         ]
 
-        # Local observation: WORLD_STATE minus walls (walls are static, add noise)
+        # Local observation: strip walls (static), agent (already in context), and
+        # teammates (already in context.teammates with roles) to avoid duplication.
         observation_clean = {
             k: v for k, v in self.WORLD_STATE.items()
-            if k != 'walls'
+            if k not in ('walls', 'agent', 'teammates')
         }
 
         # Get raw messages for planner (messages flow into planning, not reasoning)
@@ -766,13 +753,17 @@ class SearchRescueAgent(LLMAgentBase):
             'last_action': self._recent_actions[-1] if self._recent_actions else {},
             'observation': observation_clean,
             'all_discovered': {
-                'victims': self.WORLD_STATE_GLOBAL.get('victims', []),
+                'victims': [
+                    v for v in self.WORLD_STATE_GLOBAL.get('victims', [])
+                    if v.get('object_id') not in {
+                        r['victim_id'] for r in (self._get_rescued_victims() or [])
+                    }
+                ],
                 'obstacles': self.WORLD_STATE_GLOBAL.get('obstacles', []),
             },
             'history': {
                 'previous_tasks': self.episode_memory.to_prompt_previous_tasks(n=5),
                 'rescued_victims': self._get_rescued_victims(),
-                'area_coverage': self.area_tracker.get_all_summaries(),
                 'messages': [
                     f"[{m['from']}] ({m['message_type']}) {m['text']}"
                     for m in raw_messages
@@ -784,6 +775,8 @@ class SearchRescueAgent(LLMAgentBase):
             f'[{self.agent_id}] PLAN inputs (tick {self._tick_count}):\n'
             + json.dumps(planning_inputs, default=str, indent=2)
         )
+
+        planning_inputs['history']['area_coverage'] = self.area_tracker.get_all_summaries()
 
         prompt = self.planner.get_planning_prompt(planning_inputs)
         self.call_llm(prompt)

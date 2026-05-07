@@ -547,8 +547,18 @@ class CollectionGoal(WorldGoal):
         if not hasattr(self, '_scored_victims'):
             self._scored_victims = set()
 
+        # Track last known carrier for each victim so we can report who rescued it
+        # even after the agent has dropped it and walked away.
+        if not hasattr(self, '_victim_last_carrier'):
+            self._victim_last_carrier = {}
+
         # Get all objects in the world
         all_objs = grid_world.environment_objects
+
+        for oid, o in all_objs.items():
+            if getattr(o, 'carried_by', None):
+                vk = f"{oid}_{o.properties.get('img_name', '')}"
+                self._victim_last_carrier[vk] = o.carried_by[0]
 
         # Use dynamic drop zone coordinates
         drop_zone_x = self._dz_x
@@ -577,12 +587,14 @@ class CollectionGoal(WorldGoal):
                 if 'healthy' in img_name.lower():
                     continue
 
+                rescuer = (obj.carried_by[0] if getattr(obj, 'carried_by', None)
+                           else self._victim_last_carrier.get(victim_key, 'unknown'))
                 if 'critical' in img_name.lower():
                     self.__score += 6
-                    print(f"[CollectionGoal] Critical victim '{img_name}' rescued! +6 points (Total: {self.__score})")
+                    print(f"VICTIM '{img_name}' SAVED by {rescuer}! +6 pts (Total: {self.__score})", flush=True)
                 elif 'mild' in img_name.lower():
                     self.__score += 3
-                    print(f"[CollectionGoal] Mild victim '{img_name}' rescued! +3 points (Total: {self.__score})")
+                    print(f"VICTIM '{img_name}' SAVED by {rescuer}! +3 pts (Total: {self.__score})", flush=True)
 
                 # Mark as scored
                 self._scored_victims.add(victim_key)

@@ -17,54 +17,62 @@ logger = logging.getLogger('Planning')
 
 CRITIC_PLAN_PROMPT = """
 You are a combined evaluator and task planner for a search-and-rescue agent.
-
-## STEP 1 — Evaluate the last action
-
-Assess whether the last action advanced the current task. Exceeding requirements counts as success.
-
-Special rules:
-- A MoveTo where the target coordinates match the agent's current position is ALWAYS a no-op failure.
-- If there is no last action (last_action is empty or null), skip this step: treat it as success=true, critique="".
-- When the action fails, your critique MUST be actionable: state what went wrong, suggest a specific next action, and note any preconditions to verify first.
+## STEP 1: EVALUATE LAST ACTION
+Assess whether the `last_action` advanced the goal.
+*   SUCCESS: The action achieved or exceeded its intent. (Note: If `last_action` is empty or null, treat it as a success).
+*   FAILURE: The action did not achieve its intent. 
+       Rule: A `MoveTo` action where the target coordinates exactly match the agent's current position is ALWAYS a no-op failure. However, this might be because something is blocking the path. You should check for this next instead of trying the same plan again.
+*   CRITIQUE: If an action fails, your critique MUST be actionable. State what went wrong, suggest a specific fix, and note preconditions to verify (e.g., "Check partner_id", "Choose new destination").\=
 
 Examples:
 INPUT: Position [3,5], Carrying mildly_injured_woman, Last action: CarryObject(object_id="mildly_injured_woman"), Task: Pick up mild victim at [3, 5]
-→ success=true, critique=""
+OUT: success=true, critique=""
 
 INPUT: Position [5,3], Last action: MoveTo(x=5, y=3), Task: Navigate to victim at [8, 7]
-→ success=false, critique="MoveTo target (5,3) equals current position — no-op. Choose a different destination toward [8, 7]."
+OUT: success=false, critique="MoveTo target (5,3) equals current position — no-op. Choose a different destination toward [8, 7]."
 
 INPUT: Position [5,10], Carrying: None, Last action: CarryObjectTogether(object_id="critically_injured_man"), Task: Carry critical victim cooperatively
-→ success=false, critique="CarryObjectTogether failed — check partner_id was provided and teammate is adjacent."
+OUT: success=false, critique="CarryObjectTogether failed — check that teammate is adjacent."
 
-## STEP 2 — Plan the next task
+## STEP 2: PLAN NEXT TASK
 
-Based on the evaluation above and the world state, output the single best NEXT task for this agent.
+Based on the evaluation above and the world state, output the single best NEXT task for yourself based on your role. IF the critique from STEP 1 indicates a failure, the next plan should
+be different from the previous one and address the failure. For example, if the last action was a failed MoveTo, check for obstacles in the observations and plan to remove them or choose a different area to search.
+If you are a searching agent, you should focus on exploring new areas, especially those with low coverage. If you are a rescuing agent, you should focus on picking up or delivering victims. 
+If you are a heavy_duty agent, you should focus on removing obstacles or assisting teammates.
+You are free to ignore your role for the next task, but you should choose actions that fit the current situation, your agent's capabilities and your team's needs.
 
 Rules:
-- Output exactly ONE single-sentence task.
-- The task must be immediately actionable by this agent.
-- Do NOT output explanations, reasoning, lists, or multiple options.
 - Do NOT assign tasks that are already completed or currently being executed by another agent.
 - Include object IDs, agent IDs, area names, and [x, y] coordinates whenever known.
-- If STEP 1 found a failure, the next task should address or work around that failure.
-- NEVER assign a cooperative task where the only named partner is yourself.
+- Victims listed in history.rescued_victims are already safe — NEVER plan to rescue, carry, or interact with them.
+- If the same task appears 3 or more times in history.previous_tasks without progress, switch to a completely different task: explore a new room or area not yet covered (use history.area_coverage to find uncovered areas).
+
+## INPUT DATA REFERENCE
+*   `agent_id`: Your name.
+*   `position`: Your current [x,y] location.
+*   `current_task`: Your high-level mission goal.
+*   `critic_feedback`: Feedback on your last action. If it failed, adjust your next task to fix it.
+*   `previous_tasks`: Your recent history (avoid repeating past tasks).
+*   `observed_objects`: Known map states.
+*   `rescued_victims`: Victims already saved (do not re-rescue).
+*   `area_exploration`: Coverage % (prioritize lowest coverage areas).
 
 Good examples:
-- "Go to [8, 6] and help rescuebot0 carry victim_3 together."
+- "Respond to rescuebot0's message to carry victim_3 together by replying to the message."
 - "Deliver victim_2 to the drop zone."
 - "Pick up victim_1 at [2, 5] alone."
 - "Remove the rock blocking Area 2 at [4, 7]."
-- "Explore Area 1."
+- "Move to Area 1 door."
 
-## Output format
+## OUTPUT FORMAT
 
 Respond with a single valid JSON object — nothing else:
 {
   "reasoning": "brief explanation of what the last action did and why",
   "success": true or false,
   "critique": "actionable next step if failed, empty string if succeeded",
-  "next_task": "single-sentence next task for this agent"
+  "next_task": "single-sentence next task for this agent that is immediately actionable and addresses any critique if failed"
 }
 """
 
@@ -88,64 +96,6 @@ Example:
 4. Carry mildly_injured_woman to drop zone.
 5. Navigate to drop zone.
 6. Drop the victim at the drop zone.
-"""
-
-PLANNER_PROMPT = """
-You are the task planner for a search-and-rescue agent.
-
-Your job is to output the single best NEXT task for this agent only.
-The overall mission is to rescue all victims from all areas and deliver them to the drop zone.
-
-Rules:
-- Output exactly ONE single-sentence task.
-- The task must be immediately actionable by this agent.
-- Do NOT output explanations, reasoning, lists, or multiple options.
-- Do NOT assign tasks that are already completed or currently being executed by another agent.
-- Include object IDs, agent IDs, area names, and [x, y] coordinates whenever known.
-
-Output style:
-- Return exactly one sentence.
-- Mention the target and location when known.
-
-Good examples:
-- "Go to [8, 6] and help rescuebot0 carry victim_3 together."
-- "Deliver victim_2 to the drop zone."
-- "Pick up victim_1 at [2, 5] alone."
-- "Send ask_help for victim_3 at [8, 6] and wait adjacent to it."
-- "Remove the rock blocking Area 2 at [4, 7]."
-- "Explore Area 1."
-
-Bad outputs:
-- "I think the best plan is to first explore and then maybe rescue someone."
-- "Help teammate, or explore Area 2 if that fails."
-- "The next action depends on what the other agents do."
-
-Anti-self-assignment rule:
-- NEVER assign a cooperative task where the only named partner is yourself (agent_id).
-- Cooperative tasks (CarryObjectTogether, RemoveObjectTogether) must name a DIFFERENT agent as the partner.
-
-Teammate capabilities — you do NOT know what your teammates can do:
-- You only know YOUR OWN capabilities (see agent_capabilities field).
-- You do NOT know your teammate's vision range, strength, or medical skill.
-- Before assigning a cooperative task to a teammate, or before relying on them for a specific role,
-  you should ASK them about their capabilities via SendMessage.
-- Example: send a message like "What are your capabilities? Can you carry critically injured victims alone?"
-- If you have received a teammate's capability info in messages, use it to coordinate better.
-- If you need help with something you cannot do alone and don't know if your teammate can, ask first.
-
-Input fields reference:
-- agent_id: YOUR agent identifier — never assign cooperative tasks with yourself as partner
-- position: Your current [x, y] location
-- current_task: The high-level mission task assigned to you
-- game_rules: Official rules for carrying victims and removing obstacles — always follow these
-- critic_feedback: Whether your last action succeeded or failed — if failed, adjust the task
-- previous_tasks: Your recent task history — avoid repeating failed tasks
-- nearby_objects: Victims and obstacles within your vision range
-- observed_objects: ALL objects ever discovered across the map
-- rescued_victims: Victims already delivered to the drop zone — do not re-rescue these
-- area_exploration: Coverage % per area — prioritize areas with lowest coverage
-- messages: Recent messages from teammates — respond to ask_help requests first, and to capability questions
-- agent_capabilities: YOUR physical capabilities — only assign tasks feasible for you
 """
 
 
