@@ -125,12 +125,16 @@ def CarryObject(object_id: str, task_completing: str = "carrying victim"):
 def CarryObjectTogether(object_id: str, partner_id: str, task_completing: str = "carrying victim cooperatively"):
     """Cooperatively carry a critically injured victim with a partner agent.
     Required when your medical capability is low, or when carrying a critical victim regardless of capability.
-    BOTH agents must be adjacent (Chebyshev distance ≤ 1) to the victim before calling this.
-    After picking up, BOTH agents must call NavigateToDropZone then DropObjectTogether to score points.
+
+    Rendezvous is handled automatically: once you call this, the infrastructure
+    will navigate BOTH you and your partner to the victim via A*, fire the
+    action when both are adjacent, and then auto-pilot both agents to the
+    drop zone and drop the victim cooperatively. You do NOT need to call
+    NavigateToDropZone or Drop yourself for a cooperative carry.
 
     Args:
         object_id: The ID of the victim to carry cooperatively (from observation.nearby_victims).
-        partner_id: REQUIRED — the object_id of the adjacent teammate from observation.teammates.
+        partner_id: REQUIRED — the object_id of the teammate from observation.teammates (must match exactly).
         task_completing: Brief description of the subtask this action completes.
     """
     return 'CarryObjectTogether', {'object_id': object_id, 'partner_id': partner_id}, {'task_completing': task_completing}

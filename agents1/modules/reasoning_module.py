@@ -92,6 +92,46 @@ _REFINE_FOLLOWUP_TEMPLATE = (
 )
 
 
+def _format_reasoning_user_content(information: Dict[str, Any]) -> str:
+    agent = information.get('agent_id', 'unknown')
+    role = information.get('current_role', 'unassigned')
+    capabilities = information.get('agent_capabilities', '')
+    position = information.get('position', '?')
+    carrying = information.get('carrying', 'nothing')
+    current_task = information.get('current_task', '')
+    task_decomposition = information.get('task_decomposition', '')
+
+    last_action = information.get('last_action') or {}
+    last_action_name = last_action.get('name', '') if isinstance(last_action, dict) else ''
+    # args may be nested under 'args' key or flat at the top level
+    raw_args = last_action.get('args') if isinstance(last_action, dict) and 'args' in last_action else {
+        k: v for k, v in last_action.items() if k != 'name'
+    } if isinstance(last_action, dict) else {}
+    args_str = ', '.join(f'{k}={v}' for k, v in raw_args.items()) if raw_args else ''
+    last_action_str = f'{last_action_name}({args_str})' if last_action_name else 'none'
+
+    world: Dict[str, Any] = {'observation': information.get('observation', {})}
+    if information.get('memory'):
+        world['memory'] = information['memory']
+    if information.get('recent_actions'):
+        world['recent_actions'] = information['recent_actions']
+    if information.get('last_critique'):
+        world['last_critique'] = information['last_critique']
+
+    lines = [
+        f"Your name is {agent} with the role {role} and the following capabilities:",
+        capabilities,
+        "",
+        f"You are currently at position {position}. Carrying: {carrying}.",
+        f"Your last action was {last_action_str} which aimed to complete the current task: \"{current_task}\".",
+        f"Your current subtask is: \"{task_decomposition}\"",
+        "",
+        "== WORLD KNOWLEDGE ==",
+        to_toon(world),
+    ]
+    return '\n'.join(lines)
+
+
 class FollowupRequest:
     """Returned by a reasoning strategy when it needs another LLM call.
 
@@ -147,31 +187,11 @@ class ReasoningBase:
         return core
 
     def get_reasoning_prompt(self, information: Dict[str, Any]) -> List[Dict[str, str]]:
-        observation = information.get('observation', {})
-        task_decomposition = information.get('task_decomposition', '')
-        memory = information.get('memory', '') or 'none'
         critic_feedback = information.get('critic_feedback', '')
-        last_critique = information.get('last_critique', '')
-        recent_actions = information.get('recent_actions', [])
         game_rules = information.get('game_rules', '')
         agent_capabilities = information.get('agent_capabilities', '')
         role_prompt = information.get('role_prompt', '')
         tools_available = information.get('tools_available', [])
-
-        your_position = observation.get('agent', {}).get('location')
-
-        info_dict: Dict[str, Any] = {
-            "current_subtask": task_decomposition,
-            "your_position": your_position,
-            "observation": observation,
-            "memory": memory,
-            "recent_actions": recent_actions,
-        }
-        # critic_feedback is already injected into the system prompt as a WARNING block;
-        # including it in the user message too causes Qwen3 to pattern-match its
-        # {reasoning/success/critique} structure and output that format instead of a tool call.
-        if last_critique:
-            info_dict["last_critique"] = last_critique
 
         # Build system prompt: strategy decoration + core rules + game rules + capabilities
         decorated_core = self._decorate_system_prompt(REASONING_PROMPT_CORE)
@@ -198,7 +218,10 @@ class ReasoningBase:
 
         return [
             {"role": "system", "content": system_content},
-            {"role": "user",   "content": to_toon(info_dict)},
+            # critic_feedback is already injected into the system prompt as a WARNING block;
+            # including it in the user message too causes Qwen3 to pattern-match its
+            # {reasoning/success/critique} structure and output that format instead of a tool call.
+            {"role": "user",   "content": _format_reasoning_user_content(information)},
         ]
 
     # ── Multi-pass hook ───────────────────────────────────────────────────

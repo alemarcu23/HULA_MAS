@@ -9,13 +9,30 @@ Supports pluggable strategies that control which messages appear in prompts.
 
 import json
 import logging
+import re
 from concurrent.futures import Future
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from helpers.communication_helpers import _extract_message
 from matrx.messages.message import Message
 from agents1.async_model_prompting import _strip_thinking
 
 logger = logging.getLogger('CommunicationModule')
+
+_COORD_PATTERNS = (
+    re.compile(r'\[\s*(\d+)\s*,\s*(\d+)\s*\]'),
+    re.compile(r'\(\s*(\d+)\s*,\s*(\d+)\s*\)'),
+)
+
+
+def extract_coords_from_text(text: str) -> Optional[Tuple[int, int]]:
+    """Pull the first [x,y] or (x,y) coordinate pair from free-form text."""
+    if not text:
+        return None
+    for pat in _COORD_PATTERNS:
+        m = pat.search(text)
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+    return None
 
 _COMMUNICATION_PROMPT = """You are a communication processor for a Search and Rescue agent team.
 Extract actionable information from the following inter-agent messages.
@@ -96,6 +113,10 @@ class CommunicationModule:
         self._processed_count: int = 0
         self._strategy = _resolve_strategy(strategy)
 
+        # Newest unanswered incoming ask_help addressed to this agent (or broadcast).
+        # Shape: {'from', 'text', 'victim_location' (Optional[Tuple[int,int]]), 'tick'}
+        self._open_help_request: Optional[dict] = None
+
         # Async summarization
         self._llm_model = llm_model
         self._api_base = api_base
@@ -119,9 +140,23 @@ class CommunicationModule:
             entry = _extract_message(msg, self.agent_id)
             if entry is not None:
                 self._messages.append(entry)
+                self._track_help_request(entry)
 
         self._processed_count = new_count
         self._maybe_summarize()
+
+    def _track_help_request(self, entry: dict) -> None:
+        """Update _open_help_request based on a newly-received message."""
+        if entry.get('message_type') != 'ask_help':
+            return
+        to = entry.get('to', 'all')
+        if to not in ('all', self.agent_id):
+            return
+        self._open_help_request = {
+            'from': entry['from'],
+            'text': entry['text'],
+            'victim_location': extract_coords_from_text(entry['text']),
+        }
 
     def _poll_summary(self) -> None:
         """Non-blocking poll of pending summary future."""
@@ -211,3 +246,23 @@ class CommunicationModule:
             if msg['from'] == from_agent and msg['message_type'] == 'ask_help':
                 return True
         return False
+
+    def get_open_help_request(self) -> Optional[dict]:
+        """Return the newest unanswered incoming ask_help, or None."""
+        return self._open_help_request
+
+    def mark_help_answered(self, from_agent: str) -> None:
+        """Clear the open help-request if it came from `from_agent`."""
+        if self._open_help_request and self._open_help_request['from'] == from_agent:
+            self._open_help_request = None
+
+    def get_last_ask_help_from(self, from_agent: str) -> Optional[dict]:
+        """Return the latest ask_help message from `from_agent` with parsed coords."""
+        for msg in reversed(self._messages):
+            if msg['from'] == from_agent and msg['message_type'] == 'ask_help':
+                return {
+                    'from': msg['from'],
+                    'text': msg['text'],
+                    'victim_location': extract_coords_from_text(msg['text']),
+                }
+        return None

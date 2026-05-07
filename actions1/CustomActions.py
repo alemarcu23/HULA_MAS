@@ -199,35 +199,11 @@ class RemoveObjectTogether(Action):
                                   .replace('remove_range'.upper(), str(remove_range))
                                   .replace('object_id'.upper(), str(object_id)), False)
 
-    def is_possible(self, grid_world, agent_id, **kwargs):
-        """ Checks if an object can be removed.
-        Parameters
-        ----------
-        grid_world : GridWorld
-            The :class:`matrx.grid_world.GridWorld` instance in which the
-            object is sought according to the `object_id` parameter.
-        agent_id: str
-            The string representing the unique identified that represents the
-            agent performing this action.
-        world_state : State
-            The State object representing the entire world. Can be used to
-            simplify search of objects and properties when checking if an
-            action can be performed. Note that this is the State of the
-            entire world, not that of the agent performing the action.
-        object_id: str (Optional. Default: None)
-            The string representing the unique identifier of the
-            :class:`matrx.objects.env_object.EnvObject` that should be
-            removed. If not given, the closest object is selected.
-        remove_range : int (Optional. Default: 1)
-            The range in which the :class:`matrx.objects.env_object.EnvObject`
-            should be in for it to be removed.
-        Returns
-        -------
-        RemoveObjectResult
-            The :class:`matrx.actions.action.ActionResult` depicting the
-            action's expected success or failure and reason for that result.
-            See :class:`matrx.actions.object_actions.RemoveObjectResult` for
-            the results it can contain.
+    def is_possible(self, grid_world, agent_id, world_state=None, **kwargs):
+        """ Checks if an object can be removed cooperatively.
+
+        Cooperative removal requires BOTH agents to be within ``remove_range``
+        of the target obstacle.
         """
         agent_avatar = grid_world.get_env_object(agent_id, obj_type=AgentBody)  # get ourselves
         assert agent_avatar is not None  # check if we actually exist
@@ -252,6 +228,25 @@ class RemoveObjectTogether(Action):
         if object_id not in objects_in_range:
             return RemoveObjectResult(RemoveObjectResult.REMOVAL_FAILED.replace('object_id'.upper(),
                                                                                 str(object_id)), False)
+
+        # Cooperative: a partner must also be within remove_range (1 cell Chebyshev)
+        # of the obstacle. The rendezvous state machine normally ensures this, but
+        # this guard protects against direct invocation that bypasses rendezvous.
+        coop_range = 1
+        if world_state is not None:
+            obj_state = world_state.get(object_id) if hasattr(world_state, 'get') else None
+            if obj_state is not None:
+                partner = _find_partner_agent(world_state, agent_id)
+                if partner is None:
+                    return RemoveObjectResult(
+                        RemoveObjectResult.OBJECT_ID_NOT_WITHIN_RANGE
+                        .replace('remove_range'.upper(), str(coop_range))
+                        .replace('object_id'.upper(), str(object_id)), False)
+                if get_distance(partner['location'], obj_state['location']) > coop_range:
+                    return RemoveObjectResult(
+                        RemoveObjectResult.OBJECT_ID_NOT_WITHIN_RANGE
+                        .replace('remove_range'.upper(), str(coop_range))
+                        .replace('object_id'.upper(), str(object_id)), False)
 
         # otherwise some instance of RemoveObject is possible, although we do not know yet IF the intended removal is
         # possible.
@@ -908,7 +903,15 @@ class CarryObjectTogether(Action):
                 ), False
             )
 
-        # 3. Victim now in agent's inventory — autopilot in LLMAgentBase
+        # 3. Hide partner so the pair reads as a single visual unit during transport.
+        #    DropObjectTogether.mutate restores visibility on delivery.
+        partner_name = kwargs.get('partner_name', '')
+        if partner_name:
+            partner_body = grid_world.registered_agents.get(partner_name)
+            if partner_body is not None:
+                partner_body.change_property('visualize_opacity', 0)
+
+        # 4. Victim now in agent's inventory — autopilot in LLMAgentBase
         #    will navigate both agents to drop zone and drop there.
         return GrabObjectResult(GrabObjectResult.RESULT_SUCCESS, True)
 

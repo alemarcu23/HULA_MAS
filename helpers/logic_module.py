@@ -198,9 +198,14 @@ class ActionValidator:
                 f"You are already carrying {carrying[0]}. "
                 f"Drop it first before picking up another object.")
 
-        # Teammate adjacent to object?
+        # partner_id must be a different agent
         obj_id = args.get('object_id', '')
         partner_id = args.get('partner_id', '') or None
+        known_ids = {tid for tid, _ in teammates or set()}
+        if partner_id and partner_id not in known_ids:
+            return ValidationResult(False,
+                f"CarryObjectTogether failed: partner_id '{partner_id}' is not a "
+                f"known teammate. Valid teammates: {sorted(known_ids) or 'none'}.")
         if not _is_teammate_adjacent(obj_id, ws, teammates, partner_id=partner_id):
             who = f"Partner '{partner_id}'" if partner_id else "No teammate"
             return ValidationResult(False,
@@ -274,8 +279,13 @@ class ActionValidator:
                 f"Trees cannot be removed cooperatively. "
                 f"Use RemoveObject to remove '{obj_id}' solo.")
 
-        # Teammate adjacent to object?
+        # partner_id must be a different agent
         partner_id = args.get('partner_id', '') or None
+        known_ids = {tid for tid, _ in teammates or set()}
+        if partner_id and partner_id not in known_ids:
+            return ValidationResult(False,
+                f"RemoveObjectTogether failed: partner_id '{partner_id}' is not a "
+                f"known teammate. Valid teammates: {sorted(known_ids) or 'none'}.")
         if not _is_teammate_adjacent(obj_id, ws, teammates, partner_id=partner_id):
             who = f"Partner '{partner_id}'" if partner_id else "No teammate"
             return ValidationResult(False,

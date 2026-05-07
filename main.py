@@ -58,7 +58,7 @@ if __name__ == "__main__":
 
     ticks_per_iteration = 1200  # ticks before replanning (1200 × 0.1 s = 2 min)
 
-    world_preset = args.preset if args.preset is not None else 'mild_trees'
+    world_preset = args.preset if args.preset is not None else 'static'
     world_seed   = None      # int for reproducibility; None = random each run
 
     # ── Agents ──────────────────────────────────────────────────────────────────
@@ -211,6 +211,18 @@ if __name__ == "__main__":
                     iteration_history=it_hist,
                 )
                 sim_metrics.save(metrics_path, report)
+                # Incremental per-stream snapshots so that raw per-agent data
+                # (metrics/memory/comms) and shared memory survive even if
+                # aggregation starts failing mid-run.
+                inc_errors = sim_metrics.save_incremental(
+                    log_dir=log_dir,
+                    agents=agents if agents else [],
+                )
+                if inc_errors:
+                    print(
+                        f"[metrics] partial incremental save errors: {inc_errors}",
+                        file=sys.stderr, flush=True,
+                    )
                 perf = report.get('task_performance', {})
                 print(
                     f"[metrics] score={perf.get('score', 0)} "
@@ -332,6 +344,21 @@ if __name__ == "__main__":
             print("[metrics-final]", json.dumps(report, indent=2, default=str), flush=True)
         except Exception as e:
             print(f"[main] Failed to write simulation_metrics.json: {e}", file=sys.stderr)
+
+        # Final incremental snapshot — guarantees raw per-agent/shared data
+        # is on disk even if the aggregate above failed.
+        try:
+            inc_errors = sim_metrics.save_incremental(
+                log_dir=log_dir,
+                agents=agents if agents else [],
+            )
+            if inc_errors:
+                print(
+                    f"[main] Final incremental save had errors: {inc_errors}",
+                    file=sys.stderr,
+                )
+        except Exception as e:
+            print(f"[main] Final incremental save failed: {e}", file=sys.stderr)
 
         # Enrich score.json with agent-derived metrics (best-effort)
         try:

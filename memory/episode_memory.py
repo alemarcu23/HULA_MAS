@@ -205,15 +205,15 @@ class EpisodeMemory:
 
     def get_closed_episodes(self, n: int = 5) -> List[EpisodeRecord]:
         episodes = list(self._episodes)
-        return episodes[-n:] if n < len(episodes) else episodes
+        recent = episodes[-n:] if n < len(episodes) else episodes
+        return list(reversed(recent))
 
     # ── LLM serialization ─────────────────────────────────────────────────────
 
     def to_prompt_previous_tasks(self, n: int = 5) -> List[Dict[str, Any]]:
         """Replacement for memory.retrieve_all()[-5:] in the planning prompt.
 
-        Returns a list of compact dicts, one per closed episode, richest-first
-        (most recent last, matching the old ordering convention).
+        Returns a list of compact dicts, one per closed episode, newest first.
         """
         episodes = self.get_closed_episodes(n)
         result = []
@@ -271,7 +271,7 @@ class EpisodeMemory:
                 entry['received_messages'] = ep.received_messages
             result.append(entry)
 
-        # Append the open episode as a PENDING entry if one exists
+        # Prepend the open episode as a PENDING entry — it is the most recent
         open_ep = self._open_episode
         if open_ep is not None:
             pending: Dict[str, Any] = {
@@ -287,6 +287,6 @@ class EpisodeMemory:
                 pending['planned_task'] = open_ep.planned_task
             if open_ep.comm_sent:
                 pending['comm_sent'] = open_ep.comm_sent
-            result.append(pending)
+            result.insert(0, pending)
 
-        return result[-n:]
+        return result[:n]

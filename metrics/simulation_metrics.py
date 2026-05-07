@@ -339,9 +339,103 @@ class SimulationMetrics:
         if results is None:
             results = {}
         results = _strip_thinking(results)
+        self._atomic_write_json(path, results)
+
+    def save_incremental(
+        self,
+        log_dir: str,
+        agents: Optional[List[Any]] = None,
+    ) -> Dict[str, Optional[str]]:
+        """Write granular snapshots for per-agent metrics, per-agent memory,
+        communication logs, and shared memory. Each stream is written to its
+        own file so partial failures don't poison other streams.
+
+        Returns a dict mapping stream name -> error string (or None on success).
+        """
+        agent_list = agents if agents is not None else self._agents
+        errors: Dict[str, Optional[str]] = {}
+
+        agent_metrics_dir = os.path.join(log_dir, 'agent_metrics')
+        agent_memory_dir = os.path.join(log_dir, 'agent_memory')
+        comms_dir = os.path.join(log_dir, 'communication')
+        os.makedirs(agent_metrics_dir, exist_ok=True)
+        os.makedirs(agent_memory_dir, exist_ok=True)
+        os.makedirs(comms_dir, exist_ok=True)
+
+        # 1) Per-agent metrics (AgentMetricsTracker.to_dict())
+        for agent in agent_list:
+            aid = self._get_agent_id(agent)
+            tracker = self._get_tracker(agent)
+            if not tracker:
+                continue
+            try:
+                path = os.path.join(agent_metrics_dir, f'{aid}.json')
+                self._atomic_write_json(path, _strip_thinking(tracker.to_dict()))
+            except Exception as e:
+                errors[f'agent_metrics:{aid}'] = str(e)
+
+        # 2) Per-agent memory dumps
+        for agent in agent_list:
+            aid = self._get_agent_id(agent)
+            dump: Dict[str, Any] = {}
+            try:
+                if hasattr(agent, 'memory'):
+                    try:
+                        dump['full_memory'] = agent.memory.retrieve_all()
+                    except Exception:
+                        dump['full_memory'] = []
+                if hasattr(agent, 'area_tracker'):
+                    dump['area_exploration'] = agent.area_tracker.get_all_summaries()
+                if hasattr(agent, 'WORLD_STATE_GLOBAL'):
+                    dump['world_state_global'] = agent.WORLD_STATE_GLOBAL
+                path = os.path.join(agent_memory_dir, f'{aid}.json')
+                self._atomic_write_json(path, _strip_thinking(dump))
+            except Exception as e:
+                errors[f'agent_memory:{aid}'] = str(e)
+
+        # 3) Communication logs (per-agent all_messages_raw)
+        for agent in agent_list:
+            aid = self._get_agent_id(agent)
+            if not (hasattr(agent, 'communication')
+                    and hasattr(agent.communication, 'all_messages_raw')):
+                continue
+            try:
+                path = os.path.join(comms_dir, f'{aid}.json')
+                payload = {
+                    'agent_id': aid,
+                    'messages': agent.communication.all_messages_raw,
+                }
+                self._atomic_write_json(path, _strip_thinking(payload))
+            except Exception as e:
+                errors[f'communication:{aid}'] = str(e)
+
+        # 4) Shared memory snapshot (one file, shared across agents)
+        shared_mem_obj = None
+        for agent in agent_list:
+            sm = getattr(agent, 'shared_memory', None)
+            if sm is not None:
+                shared_mem_obj = sm
+                break
+        if shared_mem_obj is not None:
+            try:
+                path = os.path.join(log_dir, 'shared_memory.json')
+                self._atomic_write_json(
+                    path, _strip_thinking(shared_mem_obj.retrieve_all())
+                )
+            except Exception as e:
+                errors['shared_memory'] = str(e)
+
+        return errors
+
+    @staticmethod
+    def _atomic_write_json(path: str, data: Any) -> None:
+        """Write JSON atomically via tmp file + rename so readers never see
+        a half-written file and a mid-write crash can't corrupt the target."""
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-        with open(path, 'w') as f:
-            json.dump(results, f, indent=2, default=str)
+        tmp = f'{path}.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp, path)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
