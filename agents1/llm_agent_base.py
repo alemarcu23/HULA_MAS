@@ -145,6 +145,7 @@ class LLMAgentBase(ArtificialBrain, Perception):
 
         # ── Async LLM state ────────────────────────────────────────────────
         self._pending_future: Optional[Future] = None
+        self._last_validation_error: str = ''
 
         # ── Task ───────────────────────────────────────────────────────────
         self._current_task: Optional[str] = None
@@ -157,12 +158,14 @@ class LLMAgentBase(ArtificialBrain, Perception):
         self._coop_carry_victim_id: Optional[str] = None
         self._coop_carry_partner_id: Optional[str] = None
         self._coop_carry_cooldown: int = 0  # ticks to skip auto-enroll after partner timeout
+        self._coop_carry_enrolled_tick: int = 0  # tick when this agent enrolled (partner timeout baseline)
 
         # ── Cooperative remove rendezvous state machine ──────────────────────
         self._coop_remove_role: Optional[str] = None     # 'initiator' | 'partner' | None
         self._coop_remove_obj_id: Optional[str] = None
         self._coop_remove_partner_id: Optional[str] = None
         self._coop_remove_cooldown: int = 0  # ticks to skip auto-enroll after partner timeout
+        self._coop_remove_enrolled_tick: int = 0  # tick when this agent enrolled (partner timeout baseline)
 
         # ── Metrics ────────────────────────────────────────────────────────
         self.metrics: Optional[AgentMetricsTracker] = None  # initialized in initialize()
@@ -286,10 +289,12 @@ class LLMAgentBase(ArtificialBrain, Perception):
         self._coop_carry_victim_id = None
         self._coop_carry_partner_id = None
         self._coop_carry_cooldown = 0
+        self._coop_carry_enrolled_tick = 0
         self._coop_remove_role = None
         self._coop_remove_obj_id = None
         self._coop_remove_partner_id = None
         self._coop_remove_cooldown = 0
+        self._coop_remove_enrolled_tick = 0
         self._carry_autopilot = None
 
     def _begin_help_autonav(self, requester: str) -> None:
@@ -718,6 +723,7 @@ class LLMAgentBase(ArtificialBrain, Perception):
             self._coop_carry_role = 'partner'
             self._coop_carry_victim_id = rv['victim_id']
             self._coop_carry_partner_id = rv['initiator']
+            self._coop_carry_enrolled_tick = self._tick_count  # baseline for partner timeout
             self._pending_future = None  # lock out LLM on partner
             print(f'[{self.agent_id}] Auto-enrolled as partner for victim {rv["victim_id"]}')
 
@@ -740,9 +746,11 @@ class LLMAgentBase(ArtificialBrain, Perception):
             print(f'[{self.agent_id}] Rendezvous timeout for victim {victim_id_log}')
             return self._idle('rendezvous_timeout')
 
-        # Partner timeout — initiator never reached victim within expected window
+        # Partner timeout — initiator never reached victim within expected window.
+        # Use enrollment tick, not tick_started: the initiator may have set up the
+        # rendezvous long before we enrolled, so tick_started can cause an instant timeout.
         if (self._coop_carry_role == 'partner'
-                and self._tick_count - rv.get('tick_started', self._tick_count) > RENDEZVOUS_TIMEOUT_TICKS * 2):
+                and self._tick_count - self._coop_carry_enrolled_tick > RENDEZVOUS_TIMEOUT_TICKS * 2):
             victim_id_log = self._coop_carry_victim_id  # capture before clearing
             self._coop_carry_role = self._coop_carry_victim_id = self._coop_carry_partner_id = None
             self._coop_carry_cooldown = RENDEZVOUS_TIMEOUT_TICKS  # suppress immediate re-enrollment
@@ -775,10 +783,12 @@ class LLMAgentBase(ArtificialBrain, Perception):
         # Safety guard: if victim is no longer in the world (already picked up by
         # the other agent on this same tick), don't fire — MATRX would crash trying
         # to index world_state[object_id] which returns None for inventory objects.
+        # Also clear SharedMemory so the partner doesn't keep re-enrolling on a stale entry.
         if (self.state_for_navigation is not None
                 and self.state_for_navigation.get(self._coop_carry_victim_id) is None):
-            # Victim gone from world — our partner grabbed it; clear rendezvous and
-            # let _handle_carry_autopilot() detect the SM_CARRY_AUTOPILOT signal.
+            # Victim gone from world — partner grabbed it or it was rescued; clear rendezvous.
+            if self.shared_memory:
+                self.shared_memory.update(SM_RENDEZVOUS, None)
             self._coop_carry_role = self._coop_carry_victim_id = self._coop_carry_partner_id = None
             return None
 
@@ -875,6 +885,7 @@ class LLMAgentBase(ArtificialBrain, Perception):
             self._coop_remove_role = 'partner'
             self._coop_remove_obj_id = rv['object_id']
             self._coop_remove_partner_id = rv['initiator']
+            self._coop_remove_enrolled_tick = self._tick_count  # baseline for partner timeout
             self._pending_future = None
             print(f'[{self.agent_id}] Auto-enrolled as remove partner for {rv["object_id"]}')
 
@@ -895,9 +906,11 @@ class LLMAgentBase(ArtificialBrain, Perception):
             print(f'[{self.agent_id}] Remove rendezvous timeout for {obj_id_log}')
             return self._idle('remove_rendezvous_timeout')
 
-        # Partner timeout — initiator never reached obstacle within expected window
+        # Partner timeout — initiator never reached obstacle within expected window.
+        # Use enrollment tick, not tick_started: the initiator may have set up the
+        # rendezvous long before we enrolled, so tick_started can cause an instant timeout.
         if (self._coop_remove_role == 'partner'
-                and self._tick_count - rv.get('tick_started', self._tick_count) > RENDEZVOUS_TIMEOUT_TICKS * 2):
+                and self._tick_count - self._coop_remove_enrolled_tick > RENDEZVOUS_TIMEOUT_TICKS * 2):
             obj_id_log = self._coop_remove_obj_id
             self._coop_remove_role = self._coop_remove_obj_id = self._coop_remove_partner_id = None
             self._coop_remove_cooldown = RENDEZVOUS_TIMEOUT_TICKS
@@ -927,10 +940,15 @@ class LLMAgentBase(ArtificialBrain, Perception):
         if self._coop_remove_role == 'partner' and not rv.get('initiator_ready'):
             return self._idle('waiting_for_remove_initiator')
 
-        # Safety: object already gone (removed by other agent this tick)
+        # Safety: object already gone (removed by another agent or never existed).
+        # Clear SharedMemory so the partner doesn't keep re-enrolling on stale entries.
         if (self.state_for_navigation is not None
                 and self.state_for_navigation.get(self._coop_remove_obj_id) is None):
+            obj_id_log = self._coop_remove_obj_id
+            if self.shared_memory:
+                self.shared_memory.update(SM_REMOVE_RENDEZVOUS, None)
             self._coop_remove_role = self._coop_remove_obj_id = self._coop_remove_partner_id = None
+            print(f'[{self.agent_id}] Remove rendezvous abandoned — {obj_id_log} no longer in world')
             return None
 
         # Both adjacent + initiator ready → fire RemoveObjectTogether (pure code, no LLM)
@@ -949,6 +967,7 @@ class LLMAgentBase(ArtificialBrain, Perception):
         if result.valid:
             return None
         self.memory.update("action_failure", result.feedback)
+        self._last_validation_error = result.feedback
         ep = getattr(self, 'episode_memory', None)
         if ep is not None:
             ep.set_action(name, args, self._tick_count)

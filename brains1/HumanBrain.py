@@ -343,12 +343,16 @@ class HumanBrain(HumanAgentBrain):
 
         elif action in [MoveNorth.__name__, MoveNorthEast.__name__, MoveEast.__name__, MoveSouthEast.__name__, MoveSouth.__name__, MoveSouthWest.__name__, MoveWest.__name__, MoveNorthWest.__name__]:
             water_locs = []
-            if state[{"name": "water"}]:
-                for water in state[{"name": "water"}]:
+            water_objects = state[{"name": "water"}]
+            if water_objects:
+                if isinstance(water_objects, dict):
+                    water_objects = [water_objects]
+                for water in water_objects:
                     if water['location'] not in water_locs:
                         water_locs.append(water['location'])
-            if state[{"name": self.__name}]['location'] in water_locs and state[{"name": self.__name}]['location'] not in [(3,5),(9,5),(15,5),(21,5),(3,6),(9,6),(15,6),(3,17),(9,17),(15,17),(3,18),(9,18),(15,18),(21,18)]:
-                action == Idle.__name__
+            agent_loc = state[self.agent_id]['location']
+            if agent_loc in water_locs and agent_loc not in [(3,5),(9,5),(15,5),(21,5),(3,6),(9,6),(15,6),(3,17),(9,17),(15,17),(3,18),(9,18),(15,18),(21,18)]:
+                action = Idle.__name__
                 action_kwargs['duration_in_ticks'] = 5
 
         return action, action_kwargs

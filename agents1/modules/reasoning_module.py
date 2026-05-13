@@ -5,36 +5,50 @@ from helpers.toon_utils import to_toon
 
 
 REASONING_PROMPT_CORE = """
-You are a Search and Rescue agent. Your goal is to find and rescue as many victims as possible.
+You are a Search and Rescue agent. Your job each cycle is to execute the
+`current_plan` (already decided by the planner) by emitting EXACTLY ONE tool
+call.
 
-You are given a subtask. Return exactly one tool call to advance or complete it.
-- Every tool call has a `task_completing` field. Set it to the exact subtask text if this action completes the subtask. Otherwise set it to "N/A".
-- Before marking a task completed, verify from your observation that it is actually done.
-- If your subtask involves sending a message, use SendMessage with the appropriate `message_type`.
+The plan is atomic and fully specified (it includes any required victim_id,
+[x, y], obstacle_id, partner_id). You do NOT re-plan. If the plan looks
+unreachable, choose the tool call that makes the most direct progress toward
+it (e.g. MoveTo before Carry, RemoveObject if an obstacle is in the way).
 
-Core rules:
+Rules:
 - Return exactly one tool call — no natural language, no explanations.
-- NEVER call MoveTo with coordinates matching your own `your_position` — that is a no-op.
-- If `recent_actions` shows the same action 2+ times, you are looping — choose a completely different action type.
-- If `critic_feedback` reports failure, you MUST try a DIFFERENT action per the `critique` field.
-- Your action target must match the current subtask target (same object_id or location).
+- Every tool call has a `task_completing` field. Set it to the exact
+  `current_plan` text if this single action completes the plan; otherwise "N/A".
+- Verify from OBSERVATION that the plan is actually completed before setting
+  `task_completing` to anything other than "N/A".
+- The action target MUST match the plan target (same object_id / coordinates).
+- If current_plan is "Search area N for victims", you MUST call SearchArea(area=N).
+  Do NOT substitute MoveTo or MoveToArea — those do not search the area and will
+  miss victims. If an obstacle blocks the door or path, remove it first, then
+  SearchArea.
+- If the URGENT banner names an incoming help request, emit a SendMessage
+  with `message_type="help"` and `message` exactly "yes" or "no".
+- If the planner's `critique` is non-empty, treat the previous action as failed
+  and pick a DIFFERENT action that addresses the critique.
+- Loop check: if `recent_actions` shows the same action 2+ times, you are
+  looping — pick a completely different action type.
 
 Joint action requirements:
-- CarryObjectTogether / RemoveObjectTogether REQUIRE `partner_id` — use an `object_id` from observation.teammates.
-- Both you and your partner must be adjacent (Chebyshev distance ≤ 1) to the target before calling a cooperative action.
-- If no partner is adjacent, send an ask_help message via SendMessage and wait.
+- CarryObjectTogether / RemoveObjectTogether REQUIRE `partner_id` — use an
+  `object_id` from OBSERVATION.teammates.
+- Both you and the partner must be adjacent (Chebyshev distance ≤ 1) to the
+  target before issuing a cooperative action.
+- If no partner is adjacent, send an `ask_help` message via SendMessage.
 
-Teammate capabilities — you do NOT know what your teammates can do:
-- You only know YOUR OWN capabilities (listed below under YOUR CAPABILITIES).
-- You do NOT know your teammate's strength, medical skill, or vision range.
-- If you need to coordinate on a task that depends on a teammate's capabilities (e.g. "can they carry this victim alone?"),
-  send them a message asking: "What are your capabilities?" before assuming they can or cannot help.
-- If a teammate asks about your capabilities, ALWAYS reply using SendMessage with a brief description
-  (e.g. "I can carry mildly injured victims alone and have medium vision.").
-- When you know a teammate's capabilities from a previous message, use that information to divide tasks efficiently.
+Capability coordination:
+- You only know YOUR OWN capabilities (YOUR CAPABILITIES block below).
+- You do NOT know teammates' strength / medical skill / vision range.
+- If a coordination decision hinges on a teammate's capabilities, SendMessage
+  them asking "What are your capabilities?" before assuming.
+- If a teammate asks about yours, ALWAYS reply with a brief description.
 
 Messaging:
-- message_type="ask_help" to request assistance; "help" to respond; "message" for general updates or capability sharing.
+- message_type="ask_help" to request, "help" to respond yes/no, "message" for
+  general updates / capability sharing.
 """
 
 
@@ -98,37 +112,112 @@ def _format_reasoning_user_content(information: Dict[str, Any]) -> str:
     capabilities = information.get('agent_capabilities', '')
     position = information.get('position', '?')
     carrying = information.get('carrying', 'nothing')
-    current_task = information.get('current_task', '')
-    task_decomposition = information.get('task_decomposition', '')
+    current_plan = information.get('current_plan', '') or 'none'
+    motivation = information.get('motivation', '') or ''
+    critique = information.get('last_critique', '') or ''
+    observation = information.get('observation', {}) or {}
+    recent_actions = information.get('recent_actions', []) or []
 
-    last_action = information.get('last_action') or {}
-    last_action_name = last_action.get('name', '') if isinstance(last_action, dict) else ''
-    # args may be nested under 'args' key or flat at the top level
-    raw_args = last_action.get('args') if isinstance(last_action, dict) and 'args' in last_action else {
-        k: v for k, v in last_action.items() if k != 'name'
-    } if isinstance(last_action, dict) else {}
-    args_str = ', '.join(f'{k}={v}' for k, v in raw_args.items()) if raw_args else ''
-    last_action_str = f'{last_action_name}({args_str})' if last_action_name else 'none'
+    lines: List[str] = []
 
-    world: Dict[str, Any] = {'observation': information.get('observation', {})}
-    if information.get('memory'):
-        world['memory'] = information['memory']
-    if information.get('recent_actions'):
-        world['recent_actions'] = information['recent_actions']
-    if information.get('last_critique'):
-        world['last_critique'] = information['last_critique']
+    # ── URGENT (mirrors Planning) ───────────────────────────────────────────
+    urgent_help = information.get('urgent_help_request')
+    if urgent_help:
+        from_agent = urgent_help.get('from', 'teammate')
+        req_text = urgent_help.get('text', '')
+        lines.extend([
+            "== URGENT: INCOMING HELP REQUEST ==",
+            f'{from_agent} asks: "{req_text}"',
+            "You MUST emit SendMessage this cycle:",
+            '    message="yes" or "no" (exact lowercase, no extra text)',
+            f'    send_to="{from_agent}"',
+            '    message_type="help"',
+            "====================================",
+            "",
+        ])
 
-    lines = [
-        f"Your name is {agent} with the role {role} and the following capabilities:",
+    active_req = information.get('active_help_request')
+    if active_req:
+        lines.extend([
+            "== TEAM HELP-REQUEST LOCK ==",
+            f"{active_req.get('requester')} has the active ask_help for victim "
+            f"{active_req.get('victim_id')} at {active_req.get('victim_location')}.",
+            "Do NOT emit a new SendMessage with message_type='ask_help'.",
+            (f"Already assigned to {active_req.get('accepted_by')} — if you "
+             f"previously said 'yes' you have lost the assignment and your "
+             f"autonav has been cleared; resume your previous task."
+             if active_req.get('accepted_by') else
+             "Only the first 'yes' reply wins. Be decisive."),
+            "====================================",
+            "",
+        ])
+
+    # ── YOU ──────────────────────────────────────────────────────────────────
+    lines.extend([
+        "== YOU ==",
+        f"Name: {agent}",
+        f"Role: {role}",
+        "Capabilities:",
         capabilities,
+        f"Position: {position}",
+        f"Carrying: {carrying}",
         "",
-        f"You are currently at position {position}. Carrying: {carrying}.",
-        f"Your last action was {last_action_str} which aimed to complete the current task: \"{current_task}\".",
-        f"Your current subtask is: \"{task_decomposition}\"",
+    ])
+
+    # ── VALIDATION ERROR (from previous action, if any) ──────────────────────
+    last_validation_error = information.get('last_validation_error', '')
+    if last_validation_error:
+        lines.extend([
+            "== LAST ACTION REJECTED BY VALIDATOR ==",
+            last_validation_error,
+            "You must resolve this before the plan can proceed. Do NOT repeat the "
+            "rejected action. Instead:",
+            "  • If an obstacle blocks the path or door: call RemoveObject(object_id=<id>) "
+            "or RemoveObjectTogether if your strength requires it.",
+            "  • If you must navigate first: call MoveTo(x=<x>, y=<y>).",
+            "  • If a capability issue: call SendMessage to request help.",
+            "====================================",
+            "",
+        ])
+
+    # ── CURRENT PLAN ─────────────────────────────────────────────────────────
+    lines.extend([
+        "== CURRENT PLAN (decided this tick by the planner — execute it with ONE tool call) ==",
+        f'Plan:       "{current_plan}"',
+        f'Motivation: "{motivation}"',
+        f'Critique of last action (from planner): "{critique}"' if critique
+            else 'Critique of last action: (none — last action succeeded or was a SendMessage)',
         "",
-        "== WORLD KNOWLEDGE ==",
-        to_toon(world),
-    ]
+    ])
+
+    # ── OBSERVATION ──────────────────────────────────────────────────────────
+    lines.extend([
+        "== OBSERVATION (vision range only) ==",
+        to_toon({
+            'victims': observation.get('victims', []),
+            'teammates': observation.get('teammates', []),
+            'obstacles': observation.get('obstacles', []),
+        }),
+        "",
+    ])
+
+    # ── AREA DOORS ────────────────────────────────────────────────────────────
+    area_summaries = information.get('area_summaries') or []
+    if area_summaries:
+        lines.append("== AREA DOORS ==")
+        for a in area_summaries:
+            door_str = str(a['door']) if a.get('door') else "unknown"
+            lines.append(f"  {a['name']}: door={door_str}")
+        lines.append("")
+
+    # ── INSTRUCTIONS: loop tail + reminder to emit one tool call ────────────
+    lines.extend([
+        "== RECENT ACTIONS (for loop detection) ==",
+        to_toon(recent_actions) if recent_actions else "none",
+        "",
+        "Emit exactly one tool call now.",
+    ])
+
     return '\n'.join(lines)
 
 
@@ -190,7 +279,6 @@ class ReasoningBase:
         critic_feedback = information.get('critic_feedback', '')
         game_rules = information.get('game_rules', '')
         agent_capabilities = information.get('agent_capabilities', '')
-        role_prompt = information.get('role_prompt', '')
         tools_available = information.get('tools_available', [])
 
         # Build system prompt: strategy decoration + core rules + game rules + capabilities
@@ -200,8 +288,6 @@ class ReasoningBase:
             system_parts.append(game_rules)
         if agent_capabilities:
             system_parts.append(f"== YOUR CAPABILITIES ==\n{agent_capabilities}")
-        if role_prompt:
-            system_parts.append(f"== YOUR ROLE ==\n{role_prompt}")
         if tools_available:
             system_parts.append(f"== AVAILABLE TOOLS ==\n" + ', '.join(tools_available))
 

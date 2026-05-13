@@ -21,6 +21,7 @@ logger = logging.getLogger('CommunicationModule')
 _COORD_PATTERNS = (
     re.compile(r'\[\s*(\d+)\s*,\s*(\d+)\s*\]'),
     re.compile(r'\(\s*(\d+)\s*,\s*(\d+)\s*\)'),
+    re.compile(r'\bat\s+(\d+)\s*,\s*(\d+)\b'),
 )
 
 
@@ -180,20 +181,34 @@ class CommunicationModule:
         self._summary_future = None
 
     def _maybe_summarize(self) -> None:
-        """If messages exceed threshold, summarize old ones asynchronously."""
+        """If messages exceed threshold, summarize old non-help messages asynchronously.
+
+        ask_help messages are never summarized — they are kept pinned in _messages
+        so agents always see the full request text and can respond correctly.
+        """
         if self._summary_future is not None:
             return  # already in flight
         if self._llm_model is None:
             return  # no LLM configured
-        if len(self._messages) <= self._summary_threshold:
+
+        # Separate pinned help messages from summarizable ones.
+        help_msgs = [m for m in self._messages if m.get('message_type') == 'ask_help']
+        non_help = [m for m in self._messages if m.get('message_type') != 'ask_help']
+
+        if len(non_help) <= self._summary_threshold:
             return
 
-        # Split: keep recent, summarize old
         keep_count = self._summary_threshold
-        old_messages = self._messages[:-keep_count]
-        self._messages = self._messages[-keep_count:]
+        old_messages = non_help[:-keep_count]
+        # Rebuild _messages preserving original order: keep pinned help messages plus
+        # recent non-help messages.
+        recent_non_help_ids = {id(m) for m in non_help[-keep_count:]}
+        self._messages = [
+            m for m in self._messages
+            if m.get('message_type') == 'ask_help' or id(m) in recent_non_help_ids
+        ]
 
-        # Build summary prompt
+        # Build summary prompt from old non-help messages.
         old_text = '\n'.join(
             f"[{m['from']} -> {m['to']}] ({m['message_type']}) {m['text']}"
             for m in old_messages
@@ -201,8 +216,8 @@ class CommunicationModule:
         existing = f"Previous summary: {self._summary_text}\n\n" if self._summary_text else ''
 
         messages = [
-            {"role": "system", "content": "Summarize the following agent communication history concisely. Focus on key information: help requests, discoveries, task updates, and commitments made."},
-            {"role": "user", "content": f"{existing}. New messages to incorporate:\n{old_text}"},
+            {"role": "system", "content": "Summarize the following agent communication history concisely. Focus on key information: discoveries, task updates, and commitments made. Do NOT summarize help requests."},
+            {"role": "user", "content": f"{existing}New messages to incorporate:\n{old_text}"},
         ]
 
         from agents1.async_model_prompting import submit_llm_call
@@ -216,12 +231,33 @@ class CommunicationModule:
         )
 
     def get_messages(self, limit: int = 10, agent_busy: bool = False) -> List[dict]:
-        """Return messages. Applies strategy-based filtering and includes summary if available.
+        """Return messages for the LLM prompt — newest first.
+
+        - Drops messages this agent itself sent (already captured in episode
+          memory as the SendMessage action).
+        - Drops `plan_update` broadcasts entirely — high-volume noise.
+        - Tags `ask_help` entries with a [HELP REQUEST] prefix so they stand
+          out visually in the rendered prompt.
+        - The async summary, if any, is appended at the END (oldest position).
         """
-        filtered = self._strategy.filter_for_prompt(self._messages, agent_busy)
+        incoming = [
+            m for m in self._messages
+            if m.get('from') != self.agent_id
+            and m.get('message_type') != 'plan_update'
+        ]
+        filtered = self._strategy.filter_for_prompt(incoming, agent_busy)
         recent = filtered[-limit:] if len(filtered) > limit else filtered
 
+        # Newest first
+        ordered = list(reversed(recent))
+
         result = []
+        for m in ordered:
+            entry = dict(m)
+            if entry.get('message_type') == 'ask_help':
+                entry['text'] = f"[HELP REQUEST] {entry.get('text', '')}"
+            result.append(entry)
+
         if self._summary_text:
             result.append({
                 'from': 'system',
@@ -229,7 +265,6 @@ class CommunicationModule:
                 'message_type': 'message',
                 'text': f'[Earlier conversation summary] {self._summary_text}',
             })
-        result.extend(recent)
         return result
 
     @property
@@ -255,6 +290,37 @@ class CommunicationModule:
         """Clear the open help-request if it came from `from_agent`."""
         if self._open_help_request and self._open_help_request['from'] == from_agent:
             self._open_help_request = None
+
+    def purge_help_exchange(self, request_id: str, requester_id: str) -> int:
+        """Remove all messages tied to a resolved help exchange.
+
+        Drops any entry whose content carries the given ``request_id`` (set by
+        HelpCoordinator on ask_help / help / help_assigned / help_canceled /
+        help_complete) plus auto-announce "is responding to {requester}" lines
+        which lack a request_id. Clears _open_help_request if it referred to
+        the same requester. Returns the number of messages dropped.
+        """
+        announce_marker = f'responding to {requester_id} help request'
+
+        def _drop(m: dict) -> bool:
+            if m.get('request_id') == request_id and request_id:
+                return True
+            mtype = m.get('message_type', '')
+            text = m.get('text') or ''
+            if mtype == 'message' and announce_marker in text:
+                return True
+            if mtype in ('ask_help', 'help', 'help_assigned',
+                         'help_canceled', 'help_complete') \
+                    and (m.get('from') == requester_id or m.get('to') == requester_id):
+                return True
+            return False
+
+        before = len(self._messages)
+        self._messages = [m for m in self._messages if not _drop(m)]
+        dropped = before - len(self._messages)
+        if self._open_help_request and self._open_help_request.get('from') == requester_id:
+            self._open_help_request = None
+        return dropped
 
     def get_last_ask_help_from(self, from_agent: str) -> Optional[dict]:
         """Return the latest ask_help message from `from_agent` with parsed coords."""

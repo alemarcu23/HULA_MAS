@@ -34,6 +34,7 @@ class EpisodeRecord:
     comm_sent: Optional[str] = None
     critic_feedback: Optional[Dict[str, Any]] = None
     planned_task: Optional[str] = None
+    motivation: Optional[str] = None
 
     # ── Action (EXECUTE stage) ───────────────────────────────────────────────
     action_name: Optional[str] = None
@@ -48,6 +49,9 @@ class EpisodeRecord:
     tick_close: Optional[int] = None
     outcome_succeeded: Optional[bool] = None
     outcome_reason: Optional[str] = None
+
+    # ── Collaboration (cooperative-carry help exchange) ──────────────────────
+    collaboration: Optional[Dict[str, Any]] = None
 
     # ── Serialization ────────────────────────────────────────────────────────
 
@@ -64,6 +68,7 @@ class EpisodeRecord:
             'comm_sent': self.comm_sent,
             'critic_feedback': self.critic_feedback,
             'planned_task': self.planned_task,
+            'motivation': self.motivation,
             'action_name': self.action_name,
             'action_args': self.action_args,
             'tick_action': self.tick_action,
@@ -71,6 +76,7 @@ class EpisodeRecord:
             'loop_warning': self.loop_warning,
             'outcome_succeeded': self.outcome_succeeded,
             'outcome_reason': self.outcome_reason,
+            'collaboration': self.collaboration,
         }
 
     # ── Human-readable console output ────────────────────────────────────────
@@ -165,6 +171,10 @@ class EpisodeMemory:
         if self._open_episode is not None:
             self._open_episode.planned_task = task
 
+    def set_motivation(self, motivation: str) -> None:
+        if self._open_episode is not None:
+            self._open_episode.motivation = motivation
+
     def set_action(
         self,
         action_name: str,
@@ -179,6 +189,14 @@ class EpisodeMemory:
     def set_loop_warning(self, warning: str) -> None:
         if self._open_episode is not None:
             self._open_episode.loop_warning = warning
+
+    def set_collaboration(self, collab: Dict[str, Any]) -> None:
+        """Record a cooperative-carry collaboration on the open episode.
+
+        Expected keys: requester, responder, victim_id, duration_ticks, outcome.
+        """
+        if self._open_episode is not None:
+            self._open_episode.collaboration = dict(collab)
 
     def close_episode(
         self,
@@ -210,83 +228,34 @@ class EpisodeMemory:
 
     # ── LLM serialization ─────────────────────────────────────────────────────
 
-    def to_prompt_previous_tasks(self, n: int = 5) -> List[Dict[str, Any]]:
-        """Replacement for memory.retrieve_all()[-5:] in the planning prompt.
+    def to_prompt_memory(self, n: int = 10) -> List[Dict[str, Any]]:
+        """Compact per-episode summaries for the Planning prompt's MEMORY block.
 
-        Returns a list of compact dicts, one per closed episode, newest first.
+        Newest first.  Each entry carries the planning context (task, planned_task,
+        motivation, critique) plus the action taken and its MATRX outcome, so the
+        planner can spot loops and successes at a glance.
         """
         episodes = self.get_closed_episodes(n)
         result = []
         for ep in episodes:
+            outcome = (
+                'OK' if ep.outcome_succeeded is True
+                else 'FAIL' if ep.outcome_succeeded is False
+                else 'UNKNOWN'
+            )
             entry: Dict[str, Any] = {
-                'kind': 'episode',
                 'tick': ep.tick_open,
                 'task': ep.task,
-                'planned_task': ep.planned_task,
-                'action': ep.action_name,
-                'outcome_succeeded': ep.outcome_succeeded,
-                'outcome_reason': ep.outcome_reason,
+                'planned_task': ep.planned_task or '',
+                'motivation': ep.motivation or '',
+                'action': ep.action_name or '',
+                'action_args': ep.action_args or {},
+                'outcome': outcome,
+                'critique': (ep.critic_feedback or {}).get('critique', ''),
             }
-            if ep.critic_feedback:
-                entry['critique'] = ep.critic_feedback.get('critique', '')
-            if ep.loop_warning:
-                entry['loop_warning'] = ep.loop_warning
-            if ep.validation_failure:
-                entry['validation_failure'] = ep.validation_failure
             result.append(entry)
         return result
 
-    def to_prompt_memory(self, n: int = 15) -> List[Dict[str, Any]]:
-        """Replacement for memory.retrieve_all()[-15:] in the reasoning prompt.
-
-        Returns episode dicts shaped like the old flat memory entries so that
-        existing to_toon() serializers see no type change.  The open (in-flight)
-        episode is included last as a PENDING entry.
-        """
-        episodes = self.get_closed_episodes(n)
-        result = []
-        for ep in episodes:
-            entry: Dict[str, Any] = {
-                'kind': 'episode',
-                'tick': ep.tick_open,
-                'task': ep.task,
-                'role': ep.role,
-                'action': ep.action_name,
-                'action_args': ep.action_args,
-                'outcome': 'OK' if ep.outcome_succeeded else ('FAIL' if ep.outcome_succeeded is False else 'UNKNOWN'),
-                'outcome_reason': ep.outcome_reason,
-            }
-            if ep.critic_feedback:
-                entry['critique'] = ep.critic_feedback.get('critique', '')
-                entry['critic_success'] = ep.critic_feedback.get('success')
-            if ep.planned_task:
-                entry['planned_task'] = ep.planned_task
-            if ep.loop_warning:
-                entry['loop_warning'] = ep.loop_warning
-            if ep.validation_failure:
-                entry['validation_failure'] = ep.validation_failure
-            if ep.comm_sent:
-                entry['comm_sent'] = ep.comm_sent
-            if ep.received_messages:
-                entry['received_messages'] = ep.received_messages
-            result.append(entry)
-
-        # Prepend the open episode as a PENDING entry — it is the most recent
-        open_ep = self._open_episode
-        if open_ep is not None:
-            pending: Dict[str, Any] = {
-                'kind': 'episode',
-                'tick': open_ep.tick_open,
-                'task': open_ep.task,
-                'role': open_ep.role,
-                'outcome': 'PENDING',
-            }
-            if open_ep.critic_feedback:
-                pending['critique'] = open_ep.critic_feedback.get('critique', '')
-            if open_ep.planned_task:
-                pending['planned_task'] = open_ep.planned_task
-            if open_ep.comm_sent:
-                pending['comm_sent'] = open_ep.comm_sent
-            result.insert(0, pending)
-
-        return result[:n]
+    # Backwards-compat alias for any caller still using the old name.
+    def to_prompt_previous_tasks(self, n: int = 5) -> List[Dict[str, Any]]:
+        return self.to_prompt_memory(n=n)

@@ -1,7 +1,63 @@
+import ast
+import json
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from helpers.object_types import _OBJECT_TYPES
+
+
+def extract_action_json(text: str) -> Optional[Dict]:
+    """Try to recover a JSON action dict from free-form LLM text.
+
+    1. Fenced ```json ... ``` block
+    2. First ``{...}`` span (greedy)
+    3. ast.literal_eval on the same span (handles single-quoted dicts)
+    """
+    if not text:
+        return None
+    m = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except (json.JSONDecodeError, ValueError):
+            try:
+                return ast.literal_eval(m.group(0))
+            except (ValueError, SyntaxError):
+                pass
+    return None
+
+
+def log_stage_inputs(agent_id: str, stage: str, tick: int, inputs: Dict[str, Any]) -> None:
+    """Print a concise type-and-preview summary of LLM stage inputs."""
+    def _fmt(v: Any) -> str:
+        if v is None:
+            return 'None'
+        if isinstance(v, bool):
+            return str(v)
+        if isinstance(v, str):
+            trimmed = v.replace('\n', ' ')
+            return f'str({len(v)}c) "{trimmed[:80]}{"…" if len(trimmed) > 80 else ""}"'
+        if isinstance(v, list):
+            if not v:
+                return 'list(0)'
+            first = str(v[0])[:60].replace('\n', ' ')
+            return f'list({len(v)}) [{first}{"…" if len(str(v[0])) > 60 else ""}]'
+        if isinstance(v, dict):
+            keys = ', '.join(str(k) for k in list(v.keys())[:6])
+            return f'dict({len(v)}) {{{keys}{", …" if len(v) > 6 else ""}}}'
+        return repr(v)[:80]
+
+    lines = [f'[{agent_id}] ── {stage} inputs (tick {tick}) ──']
+    for key, val in inputs.items():
+        lines.append(f'  {key:<22} {_fmt(val)}')
+    print('\n'.join(lines))
 
 
 @dataclass

@@ -62,16 +62,16 @@ if __name__ == "__main__":
     world_seed   = None      # int for reproducibility; None = random each run
 
     # ── Agents ──────────────────────────────────────────────────────────────────
-    num_rescue_agents = args.num_agents if args.num_agents is not None else 3
+    num_rescue_agents = args.num_agents if args.num_agents is not None else 2
 
     # Capability preset per agent; cycles if list is shorter than num_rescue_agents.
     # Options: 'scout', 'medic', 'heavy_lifter', 'generalist', or a custom dict.
-    agent_presets = ['generalist', 'generalist', 'generalist']
+    agent_presets = ['generalist', 'generalist']
 
     # Role hint per agent; injected into the LLM system prompt at startup.
     # Options: 'scout' | 'medic' | 'heavy_lifter' | 'rescuer' | 'generalist'
     # Agents are told their role but may adapt if the situation requires.
-    agent_roles = ['generalist', 'generalist', 'generalist']
+    agent_roles = ['generalist', 'generalist']
 
     # 'informed'  = agents know their capabilities from the start
     # 'discovery' = agents learn their capabilities by failing actions
@@ -79,21 +79,21 @@ if __name__ == "__main__":
 
     # Communication strategy per agent; cycles if shorter than num_rescue_agents.
     # 'always_respond' | 'busy_aware'
-    comm_strategies = ['always_respond', 'always_respond', 'always_respond']
+    comm_strategies = ['always_respond', 'always_respond']
 
     # Reasoning strategy per agent; cycles if shorter than num_rescue_agents.
     # 'io' | 'cot' | 'react' | 'reflexion' | 'self_refine' | 'self_reflective_tot'
-    reasoning_strategies = ['react', 'react', 'react']
+    reasoning_strategies = ['react', 'react']
 
     # Planning strategy per agent; cycles if shorter than num_rescue_agents.
     # 'io' | 'deps' | 'td' | 'voyager'
-    planning_strategies = ['io', 'io', 'io']
+    planning_strategies = ['io', 'io']
 
     # Replanning policy per agent; cycles if shorter than num_rescue_agents.
     # 'every_turn'  = run planner on every tick (current behavior)
     # 'critic_gated' = advance DAG on critic success, skip replan on failure,
     #                  only re-decompose when the plan is fully drained
-    replanning_policies = ['every_turn', 'every_turn', 'every_turn']
+    replanning_policies = ['every_turn', 'every_turn']
 
     # ── CLI overrides (applied after defaults so scripts can override cleanly) ──
     if args.agent_presets:

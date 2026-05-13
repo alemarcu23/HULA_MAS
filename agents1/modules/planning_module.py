@@ -12,116 +12,197 @@ except ImportError:
 logger = logging.getLogger('Planning')
 
 SYSTEM_ROLE_PROMPT = (
-    "You are a combined evaluator and task planner for a search-and-rescue agent. "
-    "Follow the instructions in the user message exactly."
+    "You are a combined critic and task planner for one Search-and-Rescue agent. "
+    "Each cycle you (1) judge whether the last executed action completed the last "
+    "planned sub-task, and (2) emit ONE atomic next sub-task. Follow the user "
+    "message exactly and return a single JSON object — no prose outside the JSON."
 )
 
 PLANNING_INSTRUCTIONS = """
-## STEP 1: EVALUATE LAST ACTION
-Assess whether the `last_action` advanced the goal.
-*   SUCCESS: The action achieved or exceeded its intent. (Note: If `last_action` is empty or null, treat it as a success).
-*   FAILURE: The action did not achieve its intent.
-       Rule: A `MoveTo` action where the target coordinates exactly match the agent's current position is ALWAYS a no-op failure. However, this might be because something is blocking the path. You should check for this next instead of trying the same plan again.
-*   CRITIQUE: If an action fails, your critique MUST be actionable. State what went wrong, suggest a specific fix, and note preconditions to verify (e.g., "Check partner_id", "Choose new destination").
+## PART 1 — CRITIC
 
-Examples:
-INPUT: Position [3,5], Carrying mildly_injured_woman, Last action: CarryObject(object_id="mildly_injured_woman"), Task: Pick up mild victim at [3, 5]
-OUT: success=true, critique=""
+Judge whether `last_action` completed `last_plan`, using the current OBSERVATION,
+WORLD STATE BELIEF, and the YOU block (position, carrying).
 
-INPUT: Position [5,3], Last action: MoveTo(x=5, y=3), Task: Navigate to victim at [8, 7]
-OUT: success=false, critique="MoveTo target (5,3) equals current position — no-op. Choose a different destination toward [8, 7]."
+Special rules — apply IN ORDER:
 
-INPUT: Position [5,10], Carrying: None, Last action: CarryObjectTogether(object_id="critically_injured_man"), Task: Carry critical victim cooperatively
-OUT: success=false, critique="CarryObjectTogether failed — check that teammate is adjacent."
+1. If `last_action.name == "SendMessage"`, ALWAYS emit:
+       success = true, critique = ""
+   Communication actions do not change the physical world; critiquing them is
+   pure noise. Do not analyse the message contents.
 
-## STEP 2: PLAN NEXT TASK
+2. If `last_action` is empty/null (first cycle), emit success = true, critique = "".
 
-Your `high_level_task` is the mission assigned to you by the coordination round (e.g. "Search area 3 for victims", "Rescue mildly_injured_woman at [4,7]"). Use the last planned sub-task and `high_level_task` together to decide the single best NEXT atomic step to execute right now.
+3. A `MoveTo` whose target [x, y] equals the agent's current position is a
+   no-op failure. Critique must suggest checking for obstacles or picking a
+   different destination.
 
-If `high_level_task` is empty, choose the most valuable action given the world state and your role.
+4. Otherwise judge based on observable evidence:
+   - Pick-up plan ⇒ success iff `carrying` now matches the targeted victim.
+   - Move-to-[x,y] plan ⇒ success iff position now equals [x,y].
+   - Remove-obstacle plan ⇒ success iff the obstacle is GONE from OBSERVATION
+     and WORLD STATE BELIEF.
+   - Drop-at-zone plan ⇒ success iff `carrying` is empty.
 
-IF the critique from STEP 1 indicates a failure, the next plan should be different from the previous one and address the failure. For example, if the last action was a failed MoveTo, check for obstacles in the observations and plan to remove them or choose a different area to search.
-If you are a searching agent, you should focus on exploring new areas, especially those with low coverage. If you are a rescuing agent, you should focus on picking up or delivering victims.
-If you are a heavy_duty agent, you should focus on removing obstacles or assisting teammates.
-You are free to ignore your role for the next task, but you should choose actions that fit the current situation, your agent's capabilities and your team's needs.
+The critique (if failure) MUST be ONE actionable sentence: name the precondition
+that was missing, or the obstacle/teammate that needs attention.
 
-Rules:
-- Do NOT assign tasks that are already completed or currently being executed by another agent.
-- Include object IDs, agent IDs, area names, and [x, y] coordinates whenever known.
-- Victims listed in HISTORY > rescued_victims are already safe — NEVER plan to rescue, carry, or interact with them.
-- If the same task appears 3 or more times in HISTORY > previous_tasks without progress, switch to a completely different task: explore a new room or area not yet covered (use HISTORY > area_coverage to find uncovered areas).
-- Output exactly ONE next_task — a single atomic step, not a list or multi-step plan.
-- Do NOT repeat a task that a teammate already has as their current_plan (see TEAM section).
 
-## INPUT DATA REFERENCE
-*   `YOU`: Your identity, role, capabilities, position, and what you are carrying.
-*   `CURRENT WORK`: Your high-level assignment, the last sub-task you were executing, and the last action you took.
-*   `TEAM`: Your teammates — their positions, roles, and current plans. Coordinate to avoid duplication.
-*   `WORLD STATE`: Current observations and all discovered objects.
-*   `HISTORY > previous_tasks`: Your recent planning history (last_task / planned_task / action / outcome). Avoid repeating past failures.
-*   `HISTORY > rescued_victims`: Victims already delivered to the drop zone — never re-rescue these.
-*   `HISTORY > area_coverage`: Coverage % per area — prioritize lowest coverage when exploring.
-*   `MESSAGES`: Recent inter-agent messages including help requests and coordination.
+## PART 2 — PLANNER
 
-Good examples of next_task:
-- "Respond to rescuebot0's message to carry victim_3 together by replying to the message."
-- "Deliver victim_2 to the drop zone."
-- "Pick up victim_1 at [2, 5] alone."
-- "Remove the rock blocking Area 2 at [4, 7]."
-- "Move to Area 1 door."
+### Alignment with high-level goal (REQUIRED)
 
-## OUTPUT FORMAT
+Your `high_level_task` is your role-based directive for the entire run. Every
+`next_plan` you emit MUST be a concrete step toward that goal. Before choosing
+a plan, ask: "Does this action advance my high-level task?" If the answer is no,
+pick a different action. The only exceptions are URGENT help requests (see below)
+and genuine blockers that must be cleared first (e.g. an obstacle preventing you
+from reaching your target).
 
-Respond with a single valid JSON object — nothing else:
+### Coherence with recent history (REQUIRED)
+
+Before emitting a plan, review MOST RECENT WORK and MEMORY (newest entries
+first). Your plan must be consistent with what you have been doing:
+
+- If `last_plan` is still in progress (target not reached, victim not picked up,
+  obstacle not removed), your `next_plan` MUST continue it — do not abandon a
+  task mid-way without a clear reason (blocker, success, or loop).
+- If MEMORY shows you repeating the same `planned_task` 3+ times with no change
+  in position or carrying, that is a loop: change approach (e.g. try a different
+  route, remove a blocking obstacle, or pick the next available target).
+- Do not jump to a completely different objective just because it appears in your
+  OBSERVATION. Stay on your current sub-task unless it is complete or blocked.
+
+### Allowed plan shapes (always include explicit IDs / coordinates)
+
+Emit ONE atomic sub-task completable by a SINGLE action. Forbidden shapes:
+"Explore all areas", "Search unexplored areas", "Rescue all victims", or any
+composite of multiple steps.
+
+- "Move to [x, y]"
+- "Pick up <victim_id> at [x, y]"
+- "Carry <victim_id>" (when already adjacent / colocated)
+- "Drop <victim_id> at drop zone [x, y]"
+- "Remove obstacle <obstacle_id> at [x, y]"
+- "Search area <N> for victims"
+- "Help <agent_id> rescue <victim_id> at [x, y]"
+- "Send message to <agent_id>: <intent>" (only when coordination is truly needed)
+
+### Area search rule (REQUIRED)
+
+`SearchArea` is the ONLY action that guarantees all victims in an area are
+found. Plain navigation (MoveTo, MoveToArea, EnterArea) does NOT search —
+it only moves the agent and may incidentally mark cells explored in the
+coverage tracker, but victims will be MISSED.
+
+- If an area's coverage is < 100%: your next plan MUST be
+  "Search area <N> for victims" (executed via SearchArea, not MoveTo).
+- Do NOT plan MoveTo or MoveToArea as a substitute for SearchArea.
+- An area showing "complete" (100%) coverage that was reached WITHOUT a
+  SearchArea call is still unsearched — schedule "Search area <N> for
+  victims" for it.
+- Only move on to a different area after coverage shows 100% AND the area
+  was reached via a SearchArea action.
+- If SearchArea is not progressing (same position in recent_actions, coverage
+  not increasing), there is likely an obstacle blocking the path inside or
+  near the door. Check observation.obstacles and clear the blocker first
+  (RemoveObject / RemoveObjectTogether), then retry SearchArea.
+
+### Continuity examples
+
+- last_plan = "Pick up victim_42 at [4, 7]"; position = [2, 1] ⇒
+    next_plan = "Move to [4, 7]"
+- last_plan = "Pick up victim_42 at [4, 7]"; position = [4, 7]; carrying empty ⇒
+    next_plan = "Pick up victim_42 at [4, 7]"
+- last_plan = "Move to [4, 7]"; critique = "MoveTo no-op, obstacle in path";
+    OBSERVATION shows rock_3 adjacent ⇒
+    next_plan = "Remove obstacle rock_3 at [4, 7]"
+- last_plan = "Search area 2 for victims"; area_coverage shows area 2 complete (100%) ⇒
+    next_plan = "Search area <next area whose coverage < 100%> for victims"
+  (If all areas are complete, move to rescuing detected victims from WORLD STATE BELIEF.)
+
+### When to switch tasks
+
+Switch to a new sub-task only when ONE of these is true:
+- The last plan SUCCEEDED and no further single-action progress toward
+  `high_level_task` is possible with the same sub-task, OR
+- MEMORY shows the same `planned_task` 3+ times with no progress (loop), OR
+- An URGENT block at the top of the prompt forces a different response.
+
+Never switch to a sub-task that is unrelated to `high_level_task` unless URGENT.
+
+### Obstacle-blocked failures (DO NOT replan from scratch)
+
+If the LAST ACTION REJECTED BY VALIDATOR block is present, the previous action
+was rejected — NOT failed by MATRX. Common obstacle-specific cases:
+
+- "obstacle '<id>' is blocking the door" → next_plan = "Remove obstacle <id> at [x, y]".
+  After removal, the NEXT cycle should return to the original plan unchanged.
+- "navigate to the door first" → next_plan = "Move to [x, y]".
+- "strength too low" → next_plan = "Send message to <teammate>: ask_help for <obstacle>".
+
+In all these cases, the high-level task is still valid. Emit ONE bridging
+sub-task to clear the blocker, then the next cycle will resume the original plan.
+Do NOT abandon or replace the high-level task because of a transient blocker.
+
+### Coordination rules
+
+- An unanswered help request in the URGENT banner MUST be answered this cycle
+  with a `SendMessage` plan ("yes" or "no"). This overrides continuity.
+- Do NOT plan a task that a teammate's TEAM.current_plan already covers
+  (treat `current_plan` as a soft signal — it may be stale, so verify against
+  OBSERVATION when in doubt).
+- Never target a victim that is missing from WORLD STATE BELIEF (rescued).
+- Never target an obstacle that is missing from WORLD STATE BELIEF (removed).
+
+The `high_level_task` in MOST RECENT WORK is derived from your assigned role(s).
+Treat it as a persistent directional goal for the entire run. Verify the current
+state against WORLD STATE BELIEF and MEMORY before acting; if one target is done,
+move to the next one that serves the same goal.
+
+
+## OUTPUT
+
+Return a single valid JSON object — and nothing else:
+
 {
-  "reasoning": "brief explanation of what the last action did and why",
-  "success": true or false,
-  "critique": "actionable next step if failed, empty string if succeeded",
-  "next_task": "single-sentence next task for this agent that is immediately actionable and addresses any critique if failed"
+  "critic": {
+    "success": true | false,
+    "critique": "actionable single sentence if failed, empty string if success or last_action was SendMessage"
+  },
+  "next_plan": "one atomic sub-task using the shapes above, with explicit IDs and coordinates so the Reasoning stage needs no extra context",
+  "motivation": "<=50 words explaining how this plan advances your high_level_task and why it is consistent with your recent history"
 }
 """
 
-# Keep backward-compat alias so any external code referencing CRITIC_PLAN_PROMPT still works.
+# Back-compat alias.
 CRITIC_PLAN_PROMPT = SYSTEM_ROLE_PROMPT + "\n" + PLANNING_INSTRUCTIONS
 
 
 # ── Strategy-specific prompt addenda ────────────────────────────────────────
-# Each strategy prepends a short instruction block to the base prompt,
-# shaping how the agent picks the single next sub-task from (high_level_task,
-# past_subtask, observations). All strategies still emit exactly one next_task.
 
 _STRATEGY_ADDENDA: Dict[str, str] = {
-    'io': "",  # baseline — no extra guidance
+    'io': "",
     'deps': (
         "[DEPS] Treat the high-level task as a chain of dependent sub-goals. "
-        "Prefer the sub-task that directly depends on the PAST sub-task having been "
-        "completed. If the past sub-task failed, the next sub-task should re-attempt "
-        "or unblock it. Output exactly ONE next_task.\n\n"
+        "Prefer the sub-task that directly depends on the last plan having been "
+        "completed. If the last plan failed, the next plan should unblock it. "
+        "Output exactly ONE next_plan.\n\n"
     ),
     'td': (
         "[TD] Think in temporal dependencies: identify the immediate prerequisite "
         "that must be satisfied before the rest of the high-level task can proceed. "
-        "Pick the one prerequisite that is now actionable given the past sub-task and "
-        "emit it as the single next_task. Output exactly ONE next_task.\n\n"
+        "Pick the one prerequisite that is now actionable. Output exactly ONE next_plan.\n\n"
     ),
     'voyager': (
-        "[Voyager] Pick the next sub-task that builds incrementally on the past "
-        "sub-task's result, expanding the frontier of useful progress. Prefer novel "
-        "areas or targets over repetition of what the past sub-task already covered. "
-        "Output exactly ONE next_task.\n\n"
+        "[Voyager] Pick the next sub-task that builds incrementally on the last "
+        "plan's result, expanding the frontier of useful progress. Prefer novel "
+        "areas / targets over repetition. Output exactly ONE next_plan.\n\n"
     ),
 }
 
 
-# ── Strategy classes ────────────────────────────────────────────────────────
-
 class PlanningBase:
-    """Base planning strategy — no prompt decoration, IO-style behavior.
-
-    Subclasses override ``prefix`` to prepend strategy-specific instructions
-    to the base planning prompt.
-    """
-
     prefix: str = _STRATEGY_ADDENDA['io']
 
     def decorate_system_prompt(self, base_prompt: str) -> str:
@@ -157,6 +238,16 @@ def build_planning_strategy(name: str) -> PlanningBase:
     return cls()
 
 
+def _format_action(action: Any) -> str:
+    if not isinstance(action, dict) or not action.get('name'):
+        return 'none'
+    raw_args = action.get('args')
+    if raw_args is None:
+        raw_args = {k: v for k, v in action.items() if k != 'name'}
+    args_str = ', '.join(f'{k}={v}' for k, v in (raw_args or {}).items())
+    return f"{action['name']}({args_str})"
+
+
 def _format_planning_user_content(information: Dict[str, Any]) -> str:
     ctx = information.get('context', {})
     agent = ctx.get('agent', 'unknown')
@@ -166,40 +257,18 @@ def _format_planning_user_content(information: Dict[str, Any]) -> str:
     carrying = ctx.get('carrying', 'nothing')
     teammates = ctx.get('teammates', [])
 
-    current_task = information.get('current_task', '') or 'none'
+    last_plan = information.get('last_plan', '') or 'none'
     high_level_task = information.get('high_level_task', '') or 'none'
+    last_action_str = _format_action(information.get('last_action'))
 
-    last_action = information.get('last_action') or {}
-    last_action_name = last_action.get('name', '') if isinstance(last_action, dict) else ''
-    raw_args = (
-        last_action.get('args')
-        if isinstance(last_action, dict) and 'args' in last_action
-        else {k: v for k, v in last_action.items() if k != 'name'}
-        if isinstance(last_action, dict)
-        else {}
-    )
-    args_str = ', '.join(f'{k}={v}' for k, v in raw_args.items()) if raw_args else ''
-    last_action_str = f'{last_action_name}({args_str})' if last_action_name else 'none'
+    observation = information.get('observation', {}) or {}
+    world_state_belief = information.get('world_state_belief', {}) or {}
+    memory = information.get('memory', []) or []
+    messages = information.get('messages', []) or []
 
-    history = information.get('history', {})
-    previous_tasks_raw = history.get('previous_tasks') or []
-    previous_tasks = [
-        {
-            'tick': ep.get('tick'),
-            'last_task': ep.get('task'),
-            'planned_task': ep.get('planned_task'),
-            'action': ep.get('action'),
-            'outcome': 'success' if ep.get('outcome_succeeded') else 'failure',
-            'critique': ep.get('critique') or '',
-        }
-        for ep in previous_tasks_raw
-    ]
+    lines: List[str] = []
 
-    messages = history.get('messages')
-
-    lines = []
-
-    # ── URGENT blocks (always first) ────────────────────────────────────────
+    # ── URGENT (always first) ───────────────────────────────────────────────
     urgent_help = information.get('urgent_help_request')
     if urgent_help:
         from_agent = urgent_help.get('from', 'teammate')
@@ -207,12 +276,26 @@ def _format_planning_user_content(information: Dict[str, Any]) -> str:
         lines.extend([
             "== URGENT: INCOMING HELP REQUEST ==",
             f'{from_agent} asks: "{req_text}"',
-            "You MUST respond this tick by calling SendMessage with:",
-            '    message="yes" or "no" (exact lowercase word, no extra text)',
+            "You MUST plan a SendMessage this cycle:",
+            '    message="yes" or "no" (exact lowercase, no extra text)',
             f'    send_to="{from_agent}"',
             '    message_type="help"',
             'Saying "yes" commits you to auto-navigate to the victim.',
-            'Say "no" if you\'re busy or already committed to a higher-priority task.',
+            "====================================",
+            "",
+        ])
+
+    active_req = information.get('active_help_request')
+    if active_req:
+        lines.extend([
+            "== TEAM HELP-REQUEST LOCK ==",
+            f"Agent {active_req.get('requester')} already has an active ask_help "
+            f"for victim {active_req.get('victim_id')} at {active_req.get('victim_location')}.",
+            "Do NOT propose a new ask_help this cycle — only one help request "
+            "may be active across the team at a time.",
+            (f"Already assigned to {active_req.get('accepted_by')}."
+             if active_req.get('accepted_by') else
+             "Reply 'yes' or 'no' to that request instead of starting your own."),
             "====================================",
             "",
         ])
@@ -222,6 +305,25 @@ def _format_planning_user_content(information: Dict[str, Any]) -> str:
         lines.extend([
             "== URGENT: ABANDON CURRENT TASK ==",
             urgent_abandon,
+            "All teammates have either explicitly refused or ignored your help request.",
+            "You MUST stop waiting, pick a completely different objective, and continue your mission independently.",
+            "====================================",
+            "",
+        ])
+
+    last_validation_error = information.get('last_validation_error', '')
+    if last_validation_error:
+        lines.extend([
+            "== LAST ACTION REJECTED BY VALIDATOR ==",
+            last_validation_error,
+            "IMPORTANT — do NOT replan your entire task because of this. Instead:",
+            "  • If an obstacle is blocking the path or door: emit next_plan = "
+            "\"Remove obstacle <obstacle_id> at [x, y]\" and resume the original plan once cleared.",
+            "  • If you need to navigate to a location first: emit next_plan = "
+            "\"Move to [x, y]\" and continue from there.",
+            "  • If a partner capability issue: plan to ask for help via SendMessage.",
+            "  • Only abandon the entire plan if the target no longer exists or the "
+            "validator says the action is permanently impossible.",
             "====================================",
             "",
         ])
@@ -238,54 +340,71 @@ def _format_planning_user_content(information: Dict[str, Any]) -> str:
         "",
     ])
 
-    # ── CURRENT WORK ─────────────────────────────────────────────────────────
+    # ── MOST RECENT WORK ─────────────────────────────────────────────────────
     lines.extend([
-        "== CURRENT WORK ==",
-        f"High-level assignment: \"{high_level_task}\"",
-        f"Last planned sub-task (what the last action tried to complete): \"{current_task}\"",
-        f"Last action: {last_action_str}",
+        "== MOST RECENT WORK ==",
+        f'High-level task (in-progress assignment — VERIFY against world before continuing; may already be complete): "{high_level_task}"',
+        f'Last plan (sub-task that produced last_action): "{last_plan}"',
+        f'Last action: {last_action_str}',
         "",
     ])
 
+    # ── OBSERVATION ──────────────────────────────────────────────────────────
+    lines.extend([
+        "== OBSERVATION (vision range only — victims/teammates/obstacles right now) ==",
+        to_toon({
+            'victims': observation.get('victims', []),
+            'teammates': observation.get('teammates', []),
+            'obstacles': observation.get('obstacles', []),
+        }),
+        "",
+    ])
+
+    # ── WORLD STATE BELIEF ───────────────────────────────────────────────────
+    lines.extend([
+        "== WORLD STATE BELIEF (cumulative across the run; rescued/removed already pruned) ==",
+        to_toon({
+            'victims': world_state_belief.get('victims', {}),
+            'obstacles': world_state_belief.get('obstacles', {}),
+        }),
+        "",
+    ])
+
+    # ── AREA COVERAGE ────────────────────────────────────────────────────────
+    area_summaries = information.get('area_summaries') or []
+    if area_summaries:
+        lines.append("== AREA COVERAGE (door location + % searched) ==")
+        for a in area_summaries:
+            door_str = f"door={a['door']}" if a.get('door') else "door=unknown"
+            pct = int(a.get('coverage', 0) * 100)
+            lines.append(f"  {a['name']}: {door_str}, {pct}% searched ({a.get('status', '?')})")
+        lines.append("")
+
     # ── TEAM ─────────────────────────────────────────────────────────────────
     lines.extend([
-        "== TEAM ==",
+        "== TEAM (teammates' current_plan may be outdated — soft signal only) ==",
         to_toon(teammates) if teammates else "none",
         "",
     ])
 
-    # ── INSTRUCTIONS ─────────────────────────────────────────────────────────
+    # ── MEMORY ───────────────────────────────────────────────────────────────
     lines.extend([
-        "== YOUR TASK NOW ==",
-        PLANNING_INSTRUCTIONS.strip(),
-        "",
-    ])
-
-    # ── WORLD STATE ──────────────────────────────────────────────────────────
-    lines.extend([
-        "== WORLD STATE ==",
-        to_toon({
-            'observation': information.get('observation', {}),
-            'all_discovered': information.get('all_discovered', {}),
-        }),
-        "",
-    ])
-
-    # ── HISTORY ──────────────────────────────────────────────────────────────
-    lines.extend([
-        "== HISTORY ==",
-        to_toon({
-            'previous_tasks': previous_tasks,
-            'rescued_victims': history.get('rescued_victims'),
-            'area_coverage': history.get('area_coverage'),
-        }),
+        "== MEMORY (past episodes, newest first; each carries motivation + outcome) ==",
+        to_toon(memory) if memory else "none",
         "",
     ])
 
     # ── MESSAGES ─────────────────────────────────────────────────────────────
     lines.extend([
-        "== MESSAGES ==",
+        "== MESSAGES (incoming only, newest first; [HELP REQUEST] entries are critical) ==",
         to_toon(messages) if messages else "none",
+        "",
+    ])
+
+    # ── INSTRUCTIONS ─────────────────────────────────────────────────────────
+    lines.extend([
+        "== INSTRUCTIONS ==",
+        PLANNING_INSTRUCTIONS.strip(),
     ])
 
     return '\n'.join(lines)
@@ -303,7 +422,6 @@ class Planning:
 
     def get_planning_prompt(self, information: Dict[str, Any]) -> List[Dict[str, str]]:
         system_content = self.strategy.decorate_system_prompt(SYSTEM_ROLE_PROMPT)
-
         messages = [{"role": "system", "content": system_content}]
 
         try:

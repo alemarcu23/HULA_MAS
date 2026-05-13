@@ -180,8 +180,18 @@ def RemoveObjectTogether(object_id: str, partner_id: str, task_completing: str =
 @tool
 def SearchArea(area: int, task_completing: str = "searching area"):
     """Systematically search all cells inside an area for victims and obstacles.
-    You must be at the door of the area before calling this action.
-    The agent will visit every cell in the area and return to the door.
+
+    THIS IS THE ONLY ACTION THAT GUARANTEES VICTIM DETECTION IN AN AREA.
+    MoveTo/MoveToArea do NOT search — they only navigate and will MISS victims.
+    Do NOT substitute MoveTo when the plan says "Search area N for victims".
+
+    You must be at the door of the area (Chebyshev distance ≤ 1) before calling
+    this action. The agent will visit every inside cell via a serpentine path and
+    return to the door.
+
+    If SearchArea stalls (no movement progress across ticks), an obstacle is
+    likely blocking the path inside or at the door — clear it first with
+    RemoveObject or RemoveObjectTogether, then call SearchArea again.
 
     Args:
         area: The number of the area to search (1-14).

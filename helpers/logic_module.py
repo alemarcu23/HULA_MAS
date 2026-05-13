@@ -24,7 +24,7 @@ Usage:
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 from helpers.logic_helpers import (
     ValidationResult, _find_object, _agent_location, _chebyshev_distance,
-    is_object_adjacent, _get_carrying, _is_teammate_adjacent,
+    is_object_adjacent, _get_carrying, _is_teammate_adjacent, _extract_locations,
 )
 from helpers.object_types import _OBJECT_TYPES, _VICTIM_TYPES, _OBSTACLE_TYPES
 
@@ -156,8 +156,26 @@ class ActionValidator:
             return _OK
 
         if _chebyshev_distance(agent_loc, door) > 1:
+            # Check whether a visible obstacle is blocking the door
+            blocking = None
+            for obs in ws.get('obstacles', []):
+                try:
+                    for obs_loc in _extract_locations(obs):
+                        if _chebyshev_distance(obs_loc, door) <= 1:
+                            blocking = obs.get('object_id') or obs.get('id')
+                            break
+                except (ValueError, TypeError):
+                    pass
+                if blocking:
+                    break
+
+            if blocking:
+                return ValidationResult(False,
+                    f"Cannot search area {area}: obstacle '{blocking}' is blocking "
+                    f"the door at {door}. Use RemoveObject(object_id='{blocking}') to clear it first.")
             return ValidationResult(False,
-                f"You must be at the door of area {area} to search it. ")
+                f"You must navigate to the door of area {area} at {door} before calling SearchArea. "
+                f"Use MoveTo(x={door[0]}, y={door[1]}) first.")
         return _OK
 
     # ── Carry ─────────────────────────────────────────────────────────────

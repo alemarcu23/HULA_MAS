@@ -5,97 +5,60 @@ Extends LLMAgentBase which handles all infrastructure (navigation, carry
 retry, rendezvous, action validation, task injection).
 
 This class implements a multi-stage async pipeline:
-    COORDINATION → PLANNING (critic+plan) → REASONING → EXECUTE
+    PLANNING (critic+plan) → REASONING → EXECUTE
 
-COORDINATION fires at simulation start and after each rescue: a rotating
-coordinator agent assigns one high-level task to every agent, stored in
-GLOBAL_PLAN_ASSIGNMENTS in SharedMemory.
-
-Each LLM stage is non-blocking: submit a call, return Idle, poll next tick.
-Stage outputs flow forward via _pipeline_context.
+Each agent's high-level goal is derived directly from its assigned role(s)
+and remains fixed throughout the run.  Each LLM stage is non-blocking:
+submit a call, return Idle, poll next tick.  Stage outputs flow forward
+via _pipeline_context.
 """
 
-import ast
 import json
 import logging
-import re
 from collections import deque
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from helpers.logic_helpers import _chebyshev_distance
+from helpers.logic_helpers import _chebyshev_distance, extract_action_json, log_stage_inputs
 from helpers.navigation_helpers import apply_navigation
 from matrx.agents.agent_utils.state import State
 from matrx.messages.message import Message
 
 from agents1.async_model_prompting import get_llm_result, _strip_thinking
 from agents1.capabilities import DISCOVERY_NOTE, get_capability_prompt, get_game_rules
-from agents1.llm_agent_base import LLMAgentBase, SM_TASK_ASSIGNMENTS
+from agents1.llm_agent_base import LLMAgentBase
 from agents1.modules.area_tracker import AreaExplorationTracker
-from agents1.modules.coordination_module import (
-    CoordinationModule,
-    COORDINATION_TIMEOUT_TICKS,
-    COORDINATOR_LLM_TIMEOUT_TICKS,
-    COORDINATION_REGISTRATION_TICKS,
-    HISTORY_WINDOW,
-    MSG_TYPE_COORD_ASSIGNMENT,
-)
 from agents1.modules.execution_module import execute_action
+from agents1.modules.help_coordinator import (
+    HelpCoordinator,
+    ResolutionEvent,
+    MSG_ASK_HELP,
+    MSG_HELP,
+)
+from agents1.modules.help_tracker import HelpTracker, count_eligible_responders
 from agents1.modules.reasoning_module import (
-    ReasoningIO,
     ReasoningReAct,
     REASONING_STRATEGY_REGISTRY,
     FollowupRequest,
     ActionCommit,
 )
-from agents1.tool_registry import REASONING_STRATEGIES, build_tool_schemas
+from agents1.modules.role_module import (
+    ROLE_CLAIM_MSG_TYPE,
+    pick_role,
+    get_role_goal,
+    get_role_hint,
+    get_role_prompt,
+)
+from agents1.tool_registry import build_tool_schemas
 from memory.episode_memory import EpisodeMemory
 from memory.shared_memory import SharedMemory
 from worlds1.environment_info import EnvironmentInformation
 
 logger = logging.getLogger('SearchRescueAgent')
 
-# ── Role system ────────────────────────────────────────────────────────────────
-ROLE_CLAIM_MSG_TYPE = 'role_claim'  # message_type used for role announcements
-
-
-# ── Module-level helpers ────────────────────────────────────────────────────
-
-def _extract_action_json(text: str) -> Optional[Dict]:
-    """Try to recover a JSON action dict from free-form LLM text.
-
-    Useful when Ollama returns a plain-text response instead of a structured
-    tool call.  Tries three strategies in order:
-
-    1. Fenced ``json ... `` block
-    2. First ``{...}`` span (greedy)
-    3. ``ast.literal_eval`` on the same span (handles single-quoted dicts)
-    """
-    if not text:
-        return None
-    # 1. Fenced block
-    m = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except (json.JSONDecodeError, ValueError):
-            pass
-    # 2. First {...} span
-    m = re.search(r'\{.*\}', text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except (json.JSONDecodeError, ValueError):
-            try:
-                return ast.literal_eval(m.group(0))
-            except (ValueError, SyntaxError):
-                pass
-    return None
-
 
 class PipelineStage(Enum):
     IDLE = 'idle'
-    COORDINATION = 'coordination'
     PLANNING = 'planning'
     REASONING = 'reasoning'
     EXECUTE = 'execute'
@@ -106,12 +69,11 @@ class SearchRescueAgent(LLMAgentBase):
     """Rescue agent with multi-stage cognitive pipeline.
 
     Pipeline per cycle:
-        COORDINATION → PLANNING (critic+plan combined) → REASONING → EXECUTE
+        PLANNING (critic+plan combined) → REASONING → EXECUTE
 
-    COORDINATION fires at start and after each rescue: a rotating coordinator
-    assigns high-level tasks; other agents wait for their assignment.
     PLANNING evaluates the last action (critic) and decides the next atomic
     task, returning JSON {reasoning, success, critique, next_task}.
+    High-level goal is derived from the agent's assigned role(s) at startup.
     """
 
     def __init__(
@@ -178,24 +140,24 @@ class SearchRescueAgent(LLMAgentBase):
 
         # Two-level task hierarchy:
         #   _high_level_task  — coordinator-assigned mission (e.g. "Search area 2")
-        #   _current_task     — atomic next step chosen by the planner
+        #   _current_task     — atomic next step chosen by THIS cycle's planner
+        # The four fields below make the lifecycle explicit. `_last_*` are the
+        # previous cycle's pair, rolled forward at the start of each new cycle.
         self._high_level_task: str = ''
+        self._current_plan: Optional[str] = None        # set by PLAN handler this cycle
+        self._current_action: Optional[Dict[str, Any]] = None  # set by REASONING handler this cycle
+        self._last_plan: Optional[str] = None           # _current_plan from previous cycle
+        self._last_action: Optional[Dict[str, Any]] = None     # _current_action from previous cycle
 
-        # Coordination stage state
-        self.coordination = CoordinationModule(
-            agent_id=self.agent_id,
-            llm_model=llm_model,
-            api_base=api_base,
-        )
-        self._is_first_coord_cycle: bool = True
-        self._coord_round_id: Optional[int] = None
-        self._coord_trigger_tick: Optional[int] = None
-        self._coord_is_coordinator: bool = False
-        self._coord_llm_submitted: bool = False
+        # Cumulative belief over the run, keyed by object_id. Rebuilt each tick
+        # from WORLD_STATE_GLOBAL minus rescued victims / removed obstacles.
+        self._world_state_belief: Dict[str, Dict[str, Dict[str, Any]]] = {
+            'victims': {}, 'obstacles': {},
+        }
 
         # Role system — seed from hardcoded initial_role if provided
-        self._current_role: str = initial_role or ''
-        self._team_roles: Dict[str, str] = {}   # {agent_id: role} from incoming messages
+        self._current_roles: List[str] = [initial_role] if initial_role else []
+        self._team_roles: Dict[str, str] = {}   # {agent_id: comma-separated roles} from incoming messages
         self._team_plans: Dict[str, str] = {}   # {agent_id: next_task} from plan_update messages
 
         # Anti-loop detection: track last 3 executed actions
@@ -203,10 +165,18 @@ class SearchRescueAgent(LLMAgentBase):
 
         # Structured episode memory
         self.episode_memory = EpisodeMemory()
+        # Help-request response tracking
+        self.help_tracker = HelpTracker(self.agent_id, shared_memory)
+        # Message-based help-request coordinator (single-winner protocol).
+        # Use the agent name as the stable identifier — MATRX may set
+        # self.agent_id only after construction.
+        self.help_coord = HelpCoordinator(self.agent_id or name)
         # Communication dedup: skip sending identical messages back-to-back
         self._recent_sent_msgs: deque = deque(maxlen=3)
         # Critic dedup: avoid injecting identical failure feedback twice in a row
         self._last_critic_failure_critique: str = ''
+        # Carries the human-readable help-cancel reason into the next planning cycle.
+        self._pending_help_abandon: Optional[str] = None
 
         print(
             f'[SearchRescueAgent] Created '
@@ -255,7 +225,7 @@ class SearchRescueAgent(LLMAgentBase):
                 sender = getattr(msg, 'from_id', '')
                 role   = content.get('role', '')
                 if sender and sender != self.agent_id and role:
-                    self._team_roles[sender] = role
+                    self._team_roles[sender] = role  # stored as comma-separated string
 
             if isinstance(content, dict) and content.get('message_type') == 'plan_update':
                 sender = getattr(msg, 'from_id', '')
@@ -268,14 +238,10 @@ class SearchRescueAgent(LLMAgentBase):
         if self.shared_memory:
             self.shared_memory.add_to_set('registered_agents', self.agent_id)
 
-        # Remove rescued victims from the global belief so agents don't re-target them.
-        if self.shared_memory:
-            rescued_ids = {v['victim_id'] for v in (self.shared_memory.retrieve('rescued_victims') or [])}
-            if rescued_ids:
-                self.WORLD_STATE_GLOBAL['victims'] = [
-                    v for v in self.WORLD_STATE_GLOBAL.get('victims', [])
-                    if v.get('object_id') not in rescued_ids
-                ]
+        # Rebuild the cumulative world_state_belief dict once per tick from
+        # WORLD_STATE_GLOBAL minus rescued victims (filter removed-obstacles
+        # is applied at execute-time; see execute()).
+        self._update_world_state_belief()
 
         # Normalize agent location to a strict (int, int) tuple.
         # MATRX may return a list or even float coords depending on the build;
@@ -300,35 +266,19 @@ class SearchRescueAgent(LLMAgentBase):
             })
         self._comm_msg_cursor = len(all_msgs)
 
-        # Intercept coord_assignment messages when the agent is NOT in the
-        # COORDINATION stage.  Handles the race where the coordinator finishes
-        # while this agent is already in PLANNING/REASONING/EXECUTE, so
-        # coordination_stage() never runs and would silently miss the message.
-        if self._pipeline_stage != PipelineStage.COORDINATION:
-            coord_task = self.coordination.ingest_assignment_message(self.received_messages)
-            if coord_task:
-                prev_stage = self._pipeline_stage.value
-                coord_state = self.shared_memory.retrieve('coordination_state') if self.shared_memory else {}
-                coordinator_id = (coord_state or {}).get('coordinator', 'unknown')
-                self._high_level_task = coord_task
-                self._current_task = ''
-                self._pending_future = None  # cancel any stale LLM call
-                self._coord_round_id = None
-                self._pipeline_stage = PipelineStage.PLANNING
-                self._write_coordination_memory(
-                    assignments={self.agent_id: coord_task},
-                    coordinator_id=coordinator_id,
-                )
-                if self.shared_memory:
-                    with self.shared_memory.lock:
-                        state = self.shared_memory.storage.get('coordination_state') or {}
-                        acked = list(state.get('acknowledged_by', []))
-                        if self.agent_id not in acked:
-                            acked.append(self.agent_id)
-                            state['acknowledged_by'] = acked
-                            self.shared_memory.storage['coordination_state'] = state
-                print(f'[{self.agent_id}] Coord assignment received outside COORDINATION stage '
-                      f'(was {prev_stage}): {coord_task!r}')
+        # ── Help-coordinator ingest (message-based single-winner protocol) ──
+        # Refresh agent_id in case MATRX assigned it after __init__.
+        self.help_coord.set_agent_id(self.agent_id)
+        rescued_ids = {
+            v.get('victim_id') for v in (self._get_rescued_victims() or []) if v.get('victim_id')
+        }
+        outbound, events = self.help_coord.ingest(
+            self.received_messages, self._tick_count, rescued_ids,
+        )
+        for out_msg in outbound:
+            self.send_message(out_msg)
+        for ev in events:
+            self._apply_help_event(ev)
 
         # ── Periodic data-verification print (every 50 ticks) ─────────────
         if self._tick_count % 50 == 1:
@@ -400,12 +350,19 @@ class SearchRescueAgent(LLMAgentBase):
                 reason=reason,
             )
 
+        # Roll forward: this cycle's "current" becomes next cycle's "last".
+        # Critic + planner read _last_plan / _last_action, NOT _current_*.
+        self._last_plan = self._current_plan
+        self._last_action = self._current_action
+        self._current_plan = None
+        self._current_action = None
+
         # Open a fresh episode for this cycle
         self.episode_memory.open_episode(
             tick=self._tick_count,
             agent_id=self.agent_id,
             task=self._current_task or '',
-            role=self._current_role or 'unassigned',
+            role=', '.join(self._current_roles) if self._current_roles else 'unassigned',
         )
 
         # Snapshot peer messages received since the last episode opened.
@@ -424,15 +381,18 @@ class SearchRescueAgent(LLMAgentBase):
         ])
 
     def _advance_pipeline(self) -> Tuple[Optional[str], Dict]:
+        # Requester suspension: hold the pipeline while our ask_help is pending.
+        # Rendezvous / autopilot still run because they live in _run_infra,
+        # which executes before this method.
+        if self.help_coord.is_requester_waiting():
+            return self._idle(reason='awaiting_help_response')
+
         if self._pipeline_stage == PipelineStage.IDLE:
-            self._get_or_assign_role()  # assign role on first cycle only
+            self._get_or_assign_role()  # assign roles and high-level goal on first cycle only
             self._is_first_cycle = False
             self._pipeline_context = {}
             self._open_episode_cycle()
-            self._pipeline_stage = PipelineStage.COORDINATION
-
-        if self._pipeline_stage == PipelineStage.COORDINATION:
-            return self.coordination_stage()
+            self._pipeline_stage = PipelineStage.PLANNING
         if self._pipeline_stage == PipelineStage.PLANNING:
             return self.plan()
         if self._pipeline_stage == PipelineStage.REASONING:
@@ -447,13 +407,50 @@ class SearchRescueAgent(LLMAgentBase):
     def _on_llm_result(self, result) -> Tuple[Optional[str], Dict]:
         if self.metrics:
             self.metrics.record_llm_call_end()
-        if self._pipeline_stage == PipelineStage.COORDINATION:
-            return self._handle_coordination_result(result)
         if self._pipeline_stage == PipelineStage.PLANNING:
             return self._handle_planning_result(result)
         if self._pipeline_stage == PipelineStage.REASONING:
             return self._handle_reasoning_result(result)
         return self._idle()
+
+    def _update_world_state_belief(self) -> None:
+        """Rebuild self._world_state_belief from WORLD_STATE_GLOBAL.
+
+        Cumulative across the run, but prunes:
+          - Victims listed in SharedMemory['rescued_victims'].
+          - Obstacles previously removed (already filtered out of
+            WORLD_STATE_GLOBAL by execute() after RemoveObject succeeds).
+
+        Stored as dicts keyed by object_id for O(1) lookup and prompt size.
+        """
+        rescued_ids: set = set()
+        if self.shared_memory:
+            rescued_ids = {
+                v['victim_id']
+                for v in (self.shared_memory.retrieve('rescued_victims') or [])
+            }
+
+        victims: Dict[str, Dict[str, Any]] = {}
+        for v in self.WORLD_STATE_GLOBAL.get('victims', []) or []:
+            oid = v.get('object_id')
+            if not oid or oid in rescued_ids:
+                continue
+            victims[oid] = {
+                'location': v.get('location'),
+                'severity': v.get('severity'),
+            }
+
+        obstacles: Dict[str, Dict[str, Any]] = {}
+        for o in self.WORLD_STATE_GLOBAL.get('obstacles', []) or []:
+            oid = o.get('object_id')
+            if not oid:
+                continue
+            obstacles[oid] = {
+                'location': o.get('location'),
+                'type': o.get('type'),
+            }
+
+        self._world_state_belief = {'victims': victims, 'obstacles': obstacles}
 
     def _get_rescued_victims(self):
         """Derive rescued victims from SharedMemory."""
@@ -463,509 +460,50 @@ class SearchRescueAgent(LLMAgentBase):
                 return rescued
         return None
 
-    # ── Help-request response tracking ──────────────────────────────────
+    # ── Role assignment ─────────────────────────────────────────────────
 
-    _HELP_REPLIES_KEY_PREFIX = 'help_replies::'
-    HELP_RESPONSE_TIMEOUT_TICKS = 500
+    def _get_or_assign_role(self) -> List[str]:
+        """Assign agent's roles on first cycle; keep them for the rest of execution."""
+        if self._current_roles:
+            return self._current_roles
 
-    def _help_replies_key(self, requester_id: str) -> str:
-        return f'{self._HELP_REPLIES_KEY_PREFIX}{requester_id}'
-
-    def _register_help_request_sent(self, expected_responders: int) -> None:
-        """Create the shared-memory counter when this agent sends an ask_help."""
-        if not self.shared_memory:
-            return
-        self.shared_memory.update(self._help_replies_key(self.agent_id), {
-            'tick': self._tick_count,
-            'expected': max(expected_responders, 0),
-            'replies': {},
-        })
-
-    def _record_help_reply(self, requester: str, reply: str) -> None:
-        """Record a yes/no reply on the requester's counter."""
-        if not self.shared_memory:
-            return
-        key = self._help_replies_key(requester)
-        entry = self.shared_memory.retrieve(key)
-        if not entry:
-            return
-        replies = dict(entry.get('replies', {}))
-        replies[self.agent_id] = reply
-        self.shared_memory.update(key, {**entry, 'replies': replies})
-
-    def _check_help_request_outcome(self) -> Optional[str]:
-        """Return an abandon directive string if this agent's ask_help is resolved.
-
-        Resolution conditions:
-          1. All expected teammates replied and none said "yes".
-          2. At least HELP_RESPONSE_TIMEOUT_TICKS ticks elapsed since the request
-             was sent and no teammate has accepted so far.
-        A single "yes" cancels the abandon (the accepter is en route).
-        Clears the counter after producing a directive (or on accepted yes).
-        """
-        if not self.shared_memory:
-            return None
-        key = self._help_replies_key(self.agent_id)
-        entry = self.shared_memory.retrieve(key)
-        if not entry:
-            return None
-
-        replies = entry.get('replies', {}) or {}
-        expected = int(entry.get('expected', 0))
-        elapsed = self._tick_count - int(entry.get('tick', self._tick_count))
-        timed_out = elapsed >= self.HELP_RESPONSE_TIMEOUT_TICKS
-        all_replied = len(replies) >= expected and expected > 0
-
-        any_yes = any(r == 'yes' for r in replies.values())
-        if any_yes:
-            # A teammate accepted — clear the counter, no abandon needed.
-            self.shared_memory.update(key, None)
-            return None
-
-        if not (all_replied or timed_out):
-            return None
-
-        if replies and all(r == 'no' for r in replies.values()):
-            reason = 'All teammates declined your help request.'
-        elif timed_out and not replies:
-            reason = (
-                f'No teammate responded to your help request within '
-                f'{self.HELP_RESPONSE_TIMEOUT_TICKS} ticks.'
-            )
-        elif timed_out:
-            reason = (
-                f'Only {len(replies)}/{expected} teammates responded '
-                f'within {self.HELP_RESPONSE_TIMEOUT_TICKS} ticks, and none accepted.'
-            )
-        else:
-            # Edge case: expected==0 and no replies — nothing to abandon.
-            self.shared_memory.update(key, None)
-            return None
-
-        self.shared_memory.update(key, None)
-        return f'{reason} You MUST abandon this task and choose a different objective.'
-
-    # ── Prompt-input visibility ─────────────────────────────────────────
-
-    def _log_stage_inputs(self, stage: str, inputs: Dict[str, Any]) -> None:
-        """Print a concise summary of the data being sent to an LLM stage.
-
-        Each field is rendered on one line showing its type and a short preview
-        so it is easy to spot missing, empty, or unexpectedly large values at a
-        glance without wading through full prompt text.
-        """
-        def _fmt(v: Any) -> str:
-            if v is None:
-                return 'None'
-            if isinstance(v, bool):
-                return str(v)
-            if isinstance(v, str):
-                trimmed = v.replace('\n', ' ')
-                preview = trimmed[:80] + ('…' if len(trimmed) > 80 else '')
-                return f'str({len(v)}c) "{preview}"'
-            if isinstance(v, list):
-                if not v:
-                    return 'list(0)'
-                first = str(v[0])[:60].replace('\n', ' ')
-                return f'list({len(v)}) [{first}{"…" if len(str(v[0])) > 60 else ""}]'
-            if isinstance(v, dict):
-                keys = ', '.join(str(k) for k in list(v.keys())[:6])
-                suffix = ', …' if len(v) > 6 else ''
-                return f'dict({len(v)}) {{{keys}{suffix}}}'
-            return repr(v)[:80]
-
-        lines = [f'[{self.agent_id}] ── {stage} inputs (tick {self._tick_count}) ──']
-        for key, val in inputs.items():
-            lines.append(f'  {key:<22} {_fmt(val)}')
-        print('\n'.join(lines))
-
-    # ── Role system ─────────────────────────────────────────────────────
-
-    def _pick_role(self) -> str:
-        """Choose the most-needed role based on team state and world situation.
-
-        Uses only team-need logic — capability affinity is a soft prompt hint,
-        not a hard code constraint, so agents can flex when the team needs it.
-        """
-        taken = set(self._team_roles.values())
-        unrescued = self.WORLD_STATE_GLOBAL.get('victims', [])
-        obstacles  = self.WORLD_STATE_GLOBAL.get('obstacles', [])
-        unexplored = [s for s in self.area_tracker.get_all_summaries()
-                      if s['status'] != 'complete']
-
-        if 'rescuer' not in taken and unrescued:
-            return 'rescuer'
-        if 'scout' not in taken and unexplored:
-            return 'scout'
-        if 'heavy' not in taken and obstacles:
-            return 'heavy'
-        return 'rescuer'  # safe default
-
-    def _get_or_assign_role(self) -> str:
-        """Assign agent's role on first cycle; keep it for the rest of execution.
-
-        Sends a direct role_claim broadcast on first assignment — no LLM, no extra tick cost.
-        """
-        if self._current_role:
-            return self._current_role
-
-        new_role = self._pick_role()
-        self._current_role = new_role
+        self._current_roles = pick_role(
+            team_roles=self._team_roles,
+            world_victims=self.WORLD_STATE_GLOBAL.get('victims', []),
+            world_obstacles=self.WORLD_STATE_GLOBAL.get('obstacles', []),
+            area_summaries=self.area_tracker.get_all_summaries(),
+        )
         self._role_assigned_tick = self._tick_count
-        # Announce to teammates — pure send_message, no LLM
+        role_str = ', '.join(self._current_roles)
+        self._high_level_task = get_role_goal(self._current_roles)
         self.send_message(Message(
-            content={'message_type': ROLE_CLAIM_MSG_TYPE, 'role': new_role},
+            content={'message_type': ROLE_CLAIM_MSG_TYPE, 'role': role_str},
             from_id=self.agent_id,
-            to_id=None,  # broadcast
+            to_id=None,
         ))
-        print(f'[{self.agent_id}] Role → {new_role} (tick={self._tick_count})')
-        return self._current_role
+        print(f'[{self.agent_id}] Roles → {role_str} (tick={self._tick_count})')
+        return self._current_roles
 
-    def _get_role_hint(self) -> str:
-        """Return a soft capability-based hint for the LLM prompt (not enforced in code)."""
-        caps = self._capabilities or {}
-        if caps.get('vision') == 'high':
-            return 'Your high vision makes you well-suited for the scout role.'
-        if caps.get('strength') == 'high':
-            return 'Your high strength makes you well-suited for the heavy role.'
-        if caps.get('medical') == 'high':
-            return 'Your high medical skill makes you well-suited for the rescuer role.'
-        return 'Adapt your role to what the team needs most.'
-
-    _ROLE_DESCRIPTIONS: Dict[str, str] = {
-        'scout':        'Your assigned role is SCOUT. Prioritise exploring unmapped areas and reporting discoveries to your team.',
-        'medic':        'Your assigned role is MEDIC. Prioritise locating and carrying injured victims to the drop zone.',
-        'heavy_lifter': 'Your assigned role is HEAVY LIFTER. Prioritise removing large obstacles (rocks, trees) to open paths for teammates.',
-        'rescuer':      'Your assigned role is RESCUER. Prioritise picking up victims and delivering them to the drop zone.',
-        'generalist':   'Your assigned role is GENERALIST. Balance exploration, rescue, and obstacle removal according to what the team needs most.',
-    }
-
-    def _get_role_prompt(self) -> str:
-        """Return the role description for injection into the LLM system prompt."""
-        role = self._current_role or 'generalist'
-        base = self._ROLE_DESCRIPTIONS.get(
-            role, f'Your assigned role is {role.upper()}.'
-        )
-        return (
-            base + ' If you judge that a different role would better serve the team '
-            'given the current situation, you may adapt your behaviour accordingly.'
-        )
-
-    # ── Shared state builders ───────────────────────────────────────────
-
-    def _build_canonical_state(self) -> Dict[str, Any]:
-        """Return a consistent base state dict shared by all pipeline stages."""
-        agent_info = self.WORLD_STATE.get('agent', {})
-        return {
-            'position': agent_info.get('location'),
-            'carrying': agent_info.get('carrying'),
-            'current_task': self._current_task,
-            'last_action': self._recent_actions[-1] if self._recent_actions else {},
-            'critic_feedback': self._pipeline_context.get('critic_result'),
-            'tick': self._tick_count,
-        }
+    # ── Common context builder ──────────────────────────────────────────
 
     def _build_common_context(self) -> Dict[str, Any]:
-        """Return game rules and capability text for injection into every LLM stage.
-
-        In 'informed' mode the agent receives its full capability profile.
-        In 'discovery' mode it receives a short note to learn from failures.
-        """
-        if self._capability_knowledge == 'informed':
-            cap_text = get_capability_prompt(self._capabilities)
-        else:
-            cap_text = DISCOVERY_NOTE
+        """Return game rules, capability text, and role prompts for LLM stages."""
+        cap_text = (
+            get_capability_prompt(self._capabilities)
+            if self._capability_knowledge == 'informed'
+            else DISCOVERY_NOTE
+        )
         return {
             'game_rules': get_game_rules(
                 drop_zone=self.env_info.drop_zone,
                 capabilities=self._capabilities if self._capability_knowledge == 'informed' else None,
             ),
             'agent_capabilities': cap_text,
-            'current_role': self._current_role or 'unassigned',
-            'role_hint': self._get_role_hint(),
-            'role_prompt': self._get_role_prompt(),
+            'current_role': ', '.join(self._current_roles) if self._current_roles else 'unassigned',
+            'role_hint': get_role_hint(self._capabilities),
+            'role_prompt': get_role_prompt(self._current_roles),
             'team_roles': self._team_roles,
         }
-
-    # ── COORDINATION stage ───────────────────────────────────────────────
-
-    def _all_agent_ids(self) -> list:
-        """Return sorted list of all registered agent IDs from SharedMemory.
-
-        Falls back to local WORLD_STATE teammates if SharedMemory is unavailable.
-        Using the registry instead of WORLD_STATE avoids split-brain coordinator
-        elections when agents start outside each other's vision range.
-        """
-        if self.shared_memory:
-            registered = self.shared_memory.retrieve('registered_agents') or []
-            if registered:
-                return sorted(set(registered))
-        teammate_ids = [t['object_id'] for t in self.WORLD_STATE.get('teammates', [])]
-        return sorted([self.agent_id] + teammate_ids)
-
-    def coordination_stage(self) -> Tuple[Optional[str], Dict]:
-        """Per-tick handler for the COORDINATION stage.
-
-        One agent per round (round-robin) submits an LLM call to assign
-        high-level tasks to all agents.  Others idle until they receive their
-        assignment via MATRX message or SharedMemory, then proceed to PLANNING.
-        """
-        if self.shared_memory is None:
-            self._pipeline_stage = PipelineStage.PLANNING
-            return self._advance_pipeline()
-
-        rescued_victims = self.shared_memory.retrieve('rescued_victims') or []
-        coord_state = self.shared_memory.retrieve('coordination_state')
-
-        should_trigger, trigger_reason = self.coordination.should_trigger(
-            rescued_victims=rescued_victims,
-            coord_state=coord_state,
-            is_first_coord_cycle=self._is_first_coord_cycle,
-            tick=self._tick_count,
-        )
-
-        if should_trigger:
-            self._is_first_coord_cycle = False
-            # Always update count so losing agents don't re-trigger for the same rescue
-            self.coordination._last_seen_rescued_count = len(rescued_victims)
-
-            agent_ids = self._all_agent_ids()
-            # Determine the round_id for this new round
-            current_counter = self.shared_memory.retrieve('coordination_round_counter') or -1
-            next_round_id = current_counter + 1
-            coordinator_id = CoordinationModule.elect_coordinator(next_round_id, agent_ids)
-
-            won = self.shared_memory.try_start_coordination(
-                round_id=next_round_id,
-                coordinator_id=coordinator_id,
-                trigger=trigger_reason,
-                trigger_tick=self._tick_count,
-                rescued_count=len(rescued_victims),
-            )
-
-            if won:
-                self._coord_round_id = next_round_id
-                self._coord_trigger_tick = self._tick_count
-                self._coord_is_coordinator = (coordinator_id == self.agent_id)
-                self._coord_llm_submitted = False
-                print(
-                    f'[{self.agent_id}] Coordination round {next_round_id} started '
-                    f'(coordinator={coordinator_id}, trigger={trigger_reason})'
-                )
-            else:
-                # Another agent started this round — discover it from SharedMemory
-                coord_state = self.shared_memory.retrieve('coordination_state') or {}
-                self._coord_round_id = coord_state.get('round_id', next_round_id)
-                self._coord_trigger_tick = coord_state.get('trigger_tick', self._tick_count)
-                self._coord_is_coordinator = (coord_state.get('coordinator') == self.agent_id)
-                self._coord_llm_submitted = self._coord_is_coordinator  # don't resubmit
-
-            return self._idle()
-
-        # No new trigger — check if we're currently in an active round
-        if self._coord_round_id is None:
-            status = (coord_state or {}).get('status')
-            if status == 'in_progress':
-                # Another agent started the round before our should_trigger check — join it.
-                self._is_first_coord_cycle = False
-                self._coord_round_id = coord_state.get('round_id')
-                self._coord_trigger_tick = coord_state.get('trigger_tick', self._tick_count)
-                self._coord_is_coordinator = (coord_state.get('coordinator') == self.agent_id)
-                self._coord_llm_submitted = self._coord_is_coordinator
-                return self._idle()
-            elif status in ('complete', 'timed_out') and coord_state.get('assignments'):
-                # Round completed before we could join — pick up assignment directly.
-                self._is_first_coord_cycle = False
-                self._coord_round_id = coord_state.get('round_id')
-                self._coord_trigger_tick = coord_state.get('trigger_tick', self._tick_count)
-                task = (coord_state.get('assignments') or {}).get(self.agent_id)
-                return self._receive_coordination_assignment(task)
-            # Genuinely no active round — proceed to planning.
-            self._pipeline_stage = PipelineStage.PLANNING
-            return self._advance_pipeline()
-
-        # ── Active round handling ──────────────────────────────────────────
-        elapsed = self._tick_count - (self._coord_trigger_tick or self._tick_count)
-
-        if self._coord_is_coordinator:
-            # Coordinator: submit LLM call once, then wait for _handle_coordination_result
-            if not self._coord_llm_submitted:
-                agent_ids = self._all_agent_ids()
-                agent_roles = {**self._team_roles, self.agent_id: self._current_role or 'unknown'}
-                agent_capabilities: Dict[str, Any] = {}
-                for aid in agent_ids:
-                    if aid == self.agent_id:
-                        agent_capabilities[aid] = self._capabilities or {}
-                history = (self.shared_memory.retrieve('GLOBAL_PLAN_ASSIGNMENTS') or [])[-HISTORY_WINDOW:]
-                prompt = self.coordination.build_coordinator_prompt(
-                    tick=self._tick_count,
-                    trigger=coord_state.get('trigger', 'start') if coord_state else 'start',
-                    agent_ids=agent_ids,
-                    agent_roles=agent_roles,
-                    agent_capabilities=agent_capabilities,
-                    area_summaries=self.area_tracker.get_all_summaries(),
-                    known_victims=self.WORLD_STATE_GLOBAL.get('victims', []),
-                    rescued_victims=rescued_victims,
-                    history=history,
-                    own_recent_memory=self.memory.retrieve_all()[-10:],
-                )
-                self.call_llm(prompt)
-                self._coord_llm_submitted = True
-                print(f'[{self.agent_id}] Coordinator LLM submitted (round={self._coord_round_id})')
-
-            # Coordinator LLM timeout fallback
-            elif elapsed >= COORDINATOR_LLM_TIMEOUT_TICKS:
-                logger.warning('[%s] Coordinator LLM timed out — using fallback assignments', self.agent_id)
-                agent_ids = self._all_agent_ids()
-                area_names = [s['name'] for s in self.area_tracker.get_all_summaries()]
-                fallback = {
-                    aid: f'Explore {area_names[i % len(area_names)]}'
-                    for i, aid in enumerate(agent_ids)
-                }
-                return self._apply_coordination_result(fallback, timed_out=True)
-
-            return self._idle()
-
-        else:
-            # Non-coordinator: check for assignment via message or SharedMemory
-            task = self.coordination.ingest_assignment_message(self.received_messages)
-            if task:
-                return self._receive_coordination_assignment(task)
-
-            complete, task = self.coordination.is_coordination_complete(
-                coord_state=self.shared_memory.retrieve('coordination_state'),
-                tick=self._tick_count,
-                trigger_tick=self._coord_trigger_tick or self._tick_count,
-            )
-            if complete:
-                return self._receive_coordination_assignment(task)
-
-            return self._idle()
-
-    def _receive_coordination_assignment(self, task: Optional[str]) -> Tuple[Optional[str], Dict]:
-        """Non-coordinator: accept assigned task and move to PLANNING."""
-        assigned = task or self._high_level_task or 'Explore unmapped areas'
-        self._high_level_task = assigned
-        self._current_task = ''  # reset so planner decomposes fresh
-
-        # Write assignment to per-agent memory for planning context
-        coord_state = self.shared_memory.retrieve('coordination_state') if self.shared_memory else {}
-        coordinator_id = (coord_state or {}).get('coordinator', 'unknown')
-        self._write_coordination_memory(
-            assignments={self.agent_id: assigned},
-            coordinator_id=coordinator_id,
-        )
-
-        # Acknowledge in SharedMemory
-        if self.shared_memory:
-            with self.shared_memory.lock:
-                state = self.shared_memory.storage.get('coordination_state') or {}
-                acked = list(state.get('acknowledged_by', []))
-                if self.agent_id not in acked:
-                    acked.append(self.agent_id)
-                    state['acknowledged_by'] = acked
-                    self.shared_memory.storage['coordination_state'] = state
-
-        print(f'[{self.agent_id}] Received coordination assignment: {assigned!r}')
-        self._coord_round_id = None
-        self._pipeline_stage = PipelineStage.PLANNING
-        return self._advance_pipeline()
-
-    def _apply_coordination_result(
-        self,
-        assignments: Dict[str, str],
-        timed_out: bool = False,
-    ) -> Tuple[Optional[str], Dict]:
-        """Coordinator: publish assignments, persist to SharedMemory, advance to PLANNING."""
-        coord_state = self.shared_memory.retrieve('coordination_state') or {}
-        trigger = coord_state.get('trigger', 'start')
-        rescued_victims = self.shared_memory.retrieve('rescued_victims') or []
-
-        # Build the PlanAssignmentRecord for GLOBAL_PLAN_ASSIGNMENTS
-        record = {
-            'round_id': self._coord_round_id,
-            'formed_by': self.agent_id,
-            'formed_at_tick': self._tick_count,
-            'trigger': trigger,
-            'rescued_count_at_formation': len(rescued_victims),
-            'area_coverage_at_formation': self.area_tracker.get_all_summaries(),
-            'known_victims_at_formation': list(self.WORLD_STATE_GLOBAL.get('victims', [])),
-            'assignments': assignments,
-            'agent_roles_at_formation': {**self._team_roles, self.agent_id: self._current_role or 'unknown'},
-        }
-        self.shared_memory.append_to_list('GLOBAL_PLAN_ASSIGNMENTS', record)
-
-        # Update coordination_state to complete
-        with self.shared_memory.lock:
-            state = self.shared_memory.storage.get('coordination_state') or {}
-            state['assignments'] = assignments
-            state['status'] = 'timed_out' if timed_out else 'complete'
-            state['completed_tick'] = self._tick_count
-            self.shared_memory.storage['coordination_state'] = state
-
-        # Send MATRX messages to each agent
-        for target_id, task in assignments.items():
-            self.send_message(Message(
-                content={
-                    'message_type': MSG_TYPE_COORD_ASSIGNMENT,
-                    'round_id': self._coord_round_id,
-                    'task': task,
-                },
-                from_id=self.agent_id,
-                to_id=target_id,
-            ))
-
-        print(
-            f'[{self.agent_id}] Coordination assignments sent (round={self._coord_round_id}): '
-            + ', '.join(f'{k}={v!r}' for k, v in assignments.items())
-        )
-
-        # Apply own assignment
-        own_task = assignments.get(self.agent_id, 'Explore unmapped areas')
-        self._high_level_task = own_task
-        self._current_task = ''  # reset for fresh planner decomposition
-
-        self._write_coordination_memory(assignments=assignments, coordinator_id=self.agent_id)
-
-        self._coord_round_id = None
-        self._pipeline_stage = PipelineStage.PLANNING
-        return self._advance_pipeline()
-
-    def _handle_coordination_result(self, result) -> Tuple[Optional[str], Dict]:
-        """LLM result handler for COORDINATION stage (coordinator only)."""
-        text = _strip_thinking(getattr(result[0], 'content', '') or '') or ''
-        agent_ids = self._all_agent_ids()
-        assignments = self.coordination.parse_coordinator_response(text, agent_ids)
-
-        if assignments is None:
-            logger.warning('[%s] Coordinator parse failed — using fallback', self.agent_id)
-            area_names = [s['name'] for s in self.area_tracker.get_all_summaries()]
-            assignments = {
-                aid: f'Explore {area_names[i % len(area_names)]}'
-                for i, aid in enumerate(agent_ids)
-            }
-
-        return self._apply_coordination_result(assignments)
-
-    def _write_coordination_memory(
-        self,
-        assignments: Dict[str, str],
-        coordinator_id: str,
-    ) -> None:
-        """Write coordination assignment + history snapshot to per-agent BaseMemory."""
-        self.memory.update('coordination_assignment', {
-            'round_id': self._coord_round_id,
-            'tick': self._tick_count,
-            'coordinator': coordinator_id,
-            'high_level_task': assignments.get(self.agent_id, ''),
-            'all_assignments': assignments,
-        })
-        if self.shared_memory:
-            global_plans = self.shared_memory.retrieve('GLOBAL_PLAN_ASSIGNMENTS') or []
-            self.memory.update('global_plan_history_snapshot', {
-                'tick': self._tick_count,
-                'recent_rounds': global_plans[-HISTORY_WINDOW:],
-            })
 
     # ── PLANNING stage (combined critic + plan) ─────────────────────────
 
@@ -973,7 +511,6 @@ class SearchRescueAgent(LLMAgentBase):
         agent_info = self.WORLD_STATE.get('agent', {})
         common_ctx = self._build_common_context()
 
-        # Enrich teammate list with known roles and current plans
         teammates_enriched = [
             {
                 'id': t['object_id'],
@@ -984,64 +521,58 @@ class SearchRescueAgent(LLMAgentBase):
             for t in self.WORLD_STATE.get('teammates', [])
         ]
 
-        # Local observation: strip walls (static), agent (already in context), and
-        # teammates (already in context.teammates with roles) to avoid duplication.
-        observation_clean = {
-            k: v for k, v in self.WORLD_STATE.items()
-            if k not in ('walls', 'agent', 'teammates')
+        # OBSERVATION = vision-range only. Strip self-state, walls, doors.
+        observation = {
+            'victims': self.WORLD_STATE.get('victims', []) or [],
+            'teammates': self.WORLD_STATE.get('teammates', []) or [],
+            'obstacles': self.WORLD_STATE.get('obstacles', []) or [],
         }
 
-        # Get raw messages for planner (messages flow into planning, not reasoning)
         agent_busy = (self._nav_target is not None
                       or self._carry_autopilot is not None
                       or self._coop_carry_role is not None
                       or self._coop_remove_role is not None)
-        raw_messages = self.communication.get_messages(limit=10, agent_busy=agent_busy)
+        messages = self.communication.get_messages(limit=10, agent_busy=agent_busy)
 
-        # URGENT: surface unanswered ask_help at the top of the prompt, but only
-        # when this agent isn't carrying a victim (can't realistically abandon).
+        # URGENT: surface unanswered ask_help only when not already carrying.
         is_carrying = bool(agent_info.get('carrying'))
         open_help = (None if is_carrying
                      else self.communication.get_open_help_request())
 
-        # Requester-side: check if our own ask_help has been resolved (all "no"
-        # or timed out) and surface an abandon directive.
-        urgent_abandon = self._check_help_request_outcome()
+        # Prefer the richer coordinator-derived abandon message; fall back to tracker.
+        urgent_abandon = self._pending_help_abandon or self.help_tracker.check_outcome(self._tick_count)
+        self._pending_help_abandon = None  # consumed — clear for next cycle
+
+        # Carry forward the latest validation error into the planning prompt so the
+        # planner knows WHY the last action failed (e.g. obstacle blocking the door).
+        # Clear immediately after reading so it doesn't persist to subsequent cycles.
+        last_validation_error = self._last_validation_error or ''
+        self._last_validation_error = ''
 
         planning_inputs = {
             'context': {
-                'time': self._tick_count,
                 'agent': self.agent_id,
-                'role': self._current_role or 'unassigned',
+                'role': ', '.join(self._current_roles) if self._current_roles else 'unassigned',
                 'position': agent_info.get('location'),
                 'carrying': agent_info.get('carrying') or 'nothing',
                 'capabilities': common_ctx['agent_capabilities'],
                 'teammates': teammates_enriched,
             },
             'high_level_task': self._high_level_task or '',
-            'past_subtask': self._current_task or '',
-            'current_task': self._current_task,
-            'last_action': self._recent_actions[-1] if self._recent_actions else {},
-            'observation': observation_clean,
-            'all_discovered': {
-                'victims': [
-                    v for v in self.WORLD_STATE_GLOBAL.get('victims', [])
-                    if v.get('object_id') not in {
-                        r['victim_id'] for r in (self._get_rescued_victims() or [])
-                    }
-                ],
-                'obstacles': self.WORLD_STATE_GLOBAL.get('obstacles', []),
-            },
-            'history': {
-                'previous_tasks': self.episode_memory.to_prompt_previous_tasks(n=5),
-                'rescued_victims': self._get_rescued_victims(),
-                'messages': [
-                    f"[{m['from']}] ({m['message_type']}) {m['text']}"
-                    for m in raw_messages
-                ] if raw_messages else None,
-            },
+            'last_plan': self._last_plan or '',
+            'last_action': self._last_action or {},
+            'observation': observation,
+            'world_state_belief': self._world_state_belief,
+            'memory': self.episode_memory.to_prompt_memory(n=10),
+            'messages': messages,
             'urgent_help_request': open_help,
             'urgent_abandon': urgent_abandon,
+            'active_help_request': self.help_coord.active_request_snapshot(),
+            'last_validation_error': last_validation_error,
+            'area_summaries': [
+                {**s, 'door': self.env_info.get_door(int(s['name'].split()[-1]))}
+                for s in self.area_tracker.get_all_summaries()
+            ],
         }
 
         print(
@@ -1049,69 +580,65 @@ class SearchRescueAgent(LLMAgentBase):
             + json.dumps(planning_inputs, default=str, indent=2)
         )
 
-        planning_inputs['history']['area_coverage'] = self.area_tracker.get_all_summaries()
-
         prompt = self.planner.get_planning_prompt(planning_inputs)
+        print(prompt)
         self.call_llm(prompt)
         return self._idle()
 
     def _handle_planning_result(self, result) -> Tuple[Optional[str], Dict]:
         text = _strip_thinking(getattr(result[0], 'content', '') or '') or ''
 
-        # Try to parse as JSON (combined critic+plan response)
         parsed = None
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, TypeError):
-            parsed = _extract_action_json(text)
+            parsed = extract_action_json(text)
 
-        if parsed and 'next_task' in parsed:
-            critic_result = {
-                'reasoning': parsed.get('reasoning', ''),
-                'success': bool(parsed.get('success', True)),
-                'critique': parsed.get('critique', ''),
-            }
-            self._pipeline_context['critic_result'] = critic_result
-            self.episode_memory.set_critic_result(critic_result)
-            # Store as a plain string — the raw {reasoning/success/critique} dict must NOT
-            # appear in the reasoning prompt's memory context, or Qwen3 pattern-matches
-            # that structure and outputs it instead of a tool call.
-            status = 'SUCCESS' if critic_result['success'] else f"FAILED: {critic_result['critique']}"
-            self.memory.update('plan_status', f"[tick {self._tick_count}] Last action: {status}")
-            print(f'[{self.agent_id}] Critic result: success={critic_result["success"]}')
-            task = parsed.get('next_task', '').strip()
+        critic_result: Dict[str, Any] = {'success': True, 'critique': ''}
+        motivation = ''
+        task = ''
+        if isinstance(parsed, dict):
+            critic_raw = parsed.get('critic')
+            if isinstance(critic_raw, dict):
+                critic_result = {
+                    'success': bool(critic_raw.get('success', True)),
+                    'critique': critic_raw.get('critique', '') or '',
+                }
+            else:
+                # Back-compat: flat fields
+                critic_result = {
+                    'success': bool(parsed.get('success', True)),
+                    'critique': parsed.get('critique', '') or '',
+                }
+            task = (parsed.get('next_plan') or parsed.get('next_task') or '').strip()
+            motivation = (parsed.get('motivation') or '').strip()
         else:
-            # Fallback: plain-text response (backward compat)
             task = text.strip()
+
+        self._pipeline_context['critic_result'] = critic_result
+        self._pipeline_context['motivation'] = motivation
+        self.episode_memory.set_critic_result(critic_result)
+
+        status = 'SUCCESS' if critic_result['success'] else f"FAILED: {critic_result['critique']}"
+        self.memory.update('plan_status', f"[tick {self._tick_count}] Last action: {status}")
+        print(f'[{self.agent_id}] Critic: success={critic_result["success"]}  '
+              f'critique={critic_result["critique"][:80]!r}')
 
         self._pipeline_context['planned_task'] = task
         self.memory.update('planned_task', {'task': task, 'tick': self._tick_count})
         self.episode_memory.set_planned_task(task)
-        print(f'[{self.agent_id}] Planned task: {task[:100]}')
+        self.episode_memory.set_motivation(motivation)
+        print(f'[{self.agent_id}] Plan: {task[:100]}  motivation: {motivation[:80]}')
 
-        # Broadcast plan to teammates via normal message bus so they know what
-        # this agent is doing next (each agent keeps its own heterogeneous memory).
         if task:
-            ep = self.episode_memory.get_open_episode()
-            last_ok = (
-                ep.critic_feedback.get('success', True)
-                if ep is not None and ep.critic_feedback
-                else True
-            )
-            summary = (
-                f"[plan_update] tick={self._tick_count} "
-                f"task={self._current_task!r} "
-                f"next={task!r} "
-                f"last_outcome={'ok' if last_ok else 'fail'}"
-            )
+            # Broadcast plan_update so peers can populate their TEAM.current_plan.
             self.send_message(Message(
-                content={'message_type': 'plan_update', 'text': summary, 'task': task},
+                content={'message_type': 'plan_update', 'text': f'plan: {task}', 'task': task},
                 from_id=self.agent_id,
                 to_id=None,
             ))
-
-        if task:
             self._current_task = task
+            self._current_plan = task
 
         self._pipeline_stage = PipelineStage.REASONING
         return self._advance_pipeline()
@@ -1125,31 +652,54 @@ class SearchRescueAgent(LLMAgentBase):
         if getattr(self.reasoning, '_phase', 'main') in ('main', 'done'):
             self.reasoning.reset_phase()
         self.memory.compress()
-        observation = dict(self.WORLD_STATE)
-        nearby_state = self.WORLD_STATE
-        if any(nearby_state.get(k) for k in ('victims', 'obstacles', 'doors')):
-            observation['known'] = {
-                k: v for k, v in nearby_state.items()
-                if k != 'teammate_positions' and v
-            }
-        observation['area_exploration'] = self.area_tracker.get_all_summaries()
 
-        state = self._build_canonical_state()
-        recent_actions_list = list(self._recent_actions)
-        last_critique = (
-            self._pipeline_context.get('critic_result') or {}
-        ).get('critique', '')
-        reasoning_inputs = {
-            **state,
-            **self._build_common_context(),
-            'agent_id': self.agent_id,
-            'task_decomposition': self._pipeline_context.get('planned_task', self._current_task),
-            'observation': observation,
-            'memory': self.episode_memory.to_prompt_memory(n=15),
-            'recent_actions': recent_actions_list,
-            'last_critique': last_critique,
-            'tools_available': list(self.tools_by_name.keys()),
+        agent_info = self.WORLD_STATE.get('agent', {})
+        observation = {
+            'victims': self.WORLD_STATE.get('victims', []) or [],
+            'teammates': self.WORLD_STATE.get('teammates', []) or [],
+            'obstacles': self.WORLD_STATE.get('obstacles', []) or [],
         }
+
+        recent_actions_list = list(self._recent_actions)
+        critic = self._pipeline_context.get('critic_result') or {}
+        last_critique = critic.get('critique', '')
+        motivation = self._pipeline_context.get('motivation', '')
+
+        common = self._build_common_context()
+        is_carrying = bool(agent_info.get('carrying'))
+        open_help = (None if is_carrying
+                     else self.communication.get_open_help_request())
+
+        reasoning_inputs = {
+            'agent_id': self.agent_id,
+            'current_role': ', '.join(self._current_roles) if self._current_roles else 'unassigned',
+            'agent_capabilities': common['agent_capabilities'],
+            'game_rules': common['game_rules'],
+            'position': agent_info.get('location'),
+            'carrying': agent_info.get('carrying') or 'nothing',
+            'current_plan': self._current_plan or self._pipeline_context.get('planned_task', ''),
+            'motivation': motivation,
+            'last_critique': last_critique,
+            'observation': observation,
+            'recent_actions': recent_actions_list,
+            'tools_available': list(self.tools_by_name.keys()),
+            'urgent_help_request': open_help,
+            'active_help_request': self.help_coord.active_request_snapshot(),
+            # Carry the latest validation error so the reasoner understands exactly
+            # why the last action was rejected (e.g. obstacle blocking the door).
+            'last_validation_error': self._last_validation_error or '',
+        }
+
+        # Enrich each area summary with its door location for the reasoning prompt
+        area_info = []
+        for s in self.area_tracker.get_all_summaries():
+            try:
+                area_id = int(s['name'].split()[-1])
+                door = self.env_info.get_door(area_id)
+            except (ValueError, AttributeError):
+                door = None
+            area_info.append({**s, 'door': door})
+        reasoning_inputs['area_summaries'] = area_info
 
         # Anti-loop injection: if all recent actions are identical, force a replan
         if len(recent_actions_list) == 3 and len(set(
@@ -1162,10 +712,10 @@ class SearchRescueAgent(LLMAgentBase):
             self.memory.update('loop_warning', {'warning': loop_msg, 'tick': self._tick_count})
             self.episode_memory.set_loop_warning(loop_msg)
             print(f'[{self.agent_id}] {loop_msg}')
-            # Inject loop warning into critic_feedback so reasoning sees it
-            if not isinstance(reasoning_inputs.get('critic_feedback'), dict):
-                reasoning_inputs['critic_feedback'] = {}
-            reasoning_inputs['critic_feedback']['loop_warning'] = loop_msg
+            reasoning_inputs['critic_feedback'] = {'success': False, 'critique': loop_msg, 'loop_warning': loop_msg}
+        elif not critic.get('success', True):
+            reasoning_inputs['critic_feedback'] = critic
+
         prompt = self.reasoning.get_reasoning_prompt(reasoning_inputs)
         self.call_llm(prompt, tools=self.tool_schemas)
         return self._idle()
@@ -1197,6 +747,7 @@ class SearchRescueAgent(LLMAgentBase):
             self._pipeline_context['action_name'] = name
             self._pipeline_context['action_args'] = args
             self._pipeline_context['_reasoning_retries'] = 0
+            self._current_action = {'name': name, 'args': args}
             self._pipeline_stage = (
                 PipelineStage.COMM_DISPATCH
                 if name == 'SendMessage'
@@ -1210,7 +761,7 @@ class SearchRescueAgent(LLMAgentBase):
             content = getattr(message, 'content', '') or ''
 
             # Path B: plain-text fallback — try to extract a JSON action dict
-            extracted = _extract_action_json(content)
+            extracted = extract_action_json(content)
             if extracted and extracted.get('name') in self.tools_by_name:
                 name = extracted['name']
                 args = extracted.get('args', extracted.get('arguments', {}))
@@ -1221,6 +772,7 @@ class SearchRescueAgent(LLMAgentBase):
                 self._pipeline_context['action_name'] = name
                 self._pipeline_context['action_args'] = args
                 self._pipeline_context['_reasoning_retries'] = 0
+                self._current_action = {'name': name, 'args': args}
                 self._pipeline_stage = (
                     PipelineStage.COMM_DISPATCH
                     if name == 'SendMessage'
@@ -1259,15 +811,104 @@ class SearchRescueAgent(LLMAgentBase):
 
         self._pipeline_context['action_name'] = name
         self._pipeline_context['action_args'] = args
-        
+        self._current_action = {'name': name, 'args': args}
+
         if name == 'SendMessage':
             self._pipeline_stage = PipelineStage.COMM_DISPATCH
         else:
             self._pipeline_stage = PipelineStage.EXECUTE
         return self._advance_pipeline()
 
+    # ── Help-coordinator helpers ────────────────────────────────────────
+
+    def _infer_help_victim(self) -> Optional[Tuple[str, Tuple[int, int]]]:
+        """Pick the nearest visible heavy victim as the target of an ask_help.
+
+        Falls back to any visible victim when no heavy one is in sight.
+        Returns (victim_id, (x, y)) or None.
+        """
+        agent_info = self.WORLD_STATE.get('agent', {}) or {}
+        loc = agent_info.get('location') or (0, 0)
+        ax, ay = int(loc[0]), int(loc[1])
+        victims = self.WORLD_STATE.get('victims', []) or []
+        if not victims:
+            return None
+
+        def _dist(v):
+            vl = v.get('location') or (v.get('x', 0), v.get('y', 0))
+            return abs(int(vl[0]) - ax) + abs(int(vl[1]) - ay)
+
+        heavy = [v for v in victims if 'critical' in (v.get('obj_id', '') or v.get('object_id', ''))]
+        pool = heavy or victims
+        chosen = min(pool, key=_dist)
+        vid = chosen.get('obj_id') or chosen.get('object_id') or ''
+        vl = chosen.get('location') or (chosen.get('x', 0), chosen.get('y', 0))
+        return (vid, (int(vl[0]), int(vl[1])))
+
+    # ── Help-coordinator event handler ──────────────────────────────────
+
+    def _apply_help_event(self, ev: ResolutionEvent) -> None:
+        """React to a resolution emitted by HelpCoordinator.ingest."""
+        rid = ev.request_id
+        requester = ev.requester or self.agent_id
+
+        # Always purge the exchange from local inbox.
+        self.communication.purge_help_exchange(rid, requester)
+
+        if ev.kind == 'rescued':
+            collab = {
+                'requester': requester,
+                'responder': ev.responder or '',
+                'victim_id': ev.victim_id or '',
+                'duration_ticks': ev.duration_ticks if ev.duration_ticks is not None else -1,
+                'outcome': 'rescued',
+            }
+            self.episode_memory.set_collaboration(collab)
+            self.memory.update('collaboration', {**collab, 'tick': self._tick_count})
+            print(f'[{self.agent_id}] Collaboration recorded: {collab}')
+        elif ev.kind == 'canceled':
+            reason = ev.reason or 'unknown'
+            collab = {
+                'requester': requester, 'victim_id': ev.victim_id or '',
+                'outcome': f'canceled:{reason}',
+            }
+            self.episode_memory.set_collaboration(collab)
+            self.memory.update('collaboration', {**collab, 'tick': self._tick_count})
+            # If WE were the requester, mark the episode failed and reset pipeline.
+            if requester == self.agent_id:
+                self.episode_memory.close_episode(
+                    tick=self._tick_count, succeeded=False,
+                    reason=f'help refused by peers ({reason})',
+                )
+                self._pipeline_stage = PipelineStage.IDLE
+                self._pending_future = None
+                # Build the human-readable abandon message for the next planning cycle.
+                _abandon_texts = {
+                    'all_declined': 'All teammates explicitly refused your help request. You MUST abandon this task and choose a different objective.',
+                    'all_ignored': (
+                        'All teammates received your help request but did not respond '
+                        'after replanning multiple times — they have seen the request and '
+                        'chosen not to help. You MUST abandon this task and choose a different objective.'
+                    ),
+                    'timeout': 'Your help request timed out with no response. You MUST abandon this task and choose a different objective.',
+                }
+                self._pending_help_abandon = _abandon_texts.get(
+                    reason,
+                    f'Help request canceled ({reason}). You MUST abandon this task and choose a different objective.',
+                )
+                # Clear the SharedMemory tracker so check_outcome() does not fire again.
+                self.help_tracker.clear_request()
+                print(f'[{self.agent_id}] Help canceled ({reason}) — episode failed, pipeline reset')
+        elif ev.kind == 'lost_assignment':
+            # Another responder was chosen — abort our autonav and resume.
+            self._nav_target = None
+            self.memory.update('help_lost_assignment', {
+                'request_id': rid, 'chosen': ev.responder, 'tick': self._tick_count,
+            })
+            print(f'[{self.agent_id}] Lost help assignment — {ev.responder} chosen, returning to task')
+
     # ── EXECUTE stage ───────────────────────────────────────────────────
-    
+
     def communicate(self) -> Tuple[Optional[str], Dict]:
         args = self._pipeline_context.get('action_args', {})
         send_to = args.get('send_to', 'all')
@@ -1275,8 +916,53 @@ class SearchRescueAgent(LLMAgentBase):
         text = args.get('message', '')
 
         target = None if send_to == 'all' else send_to
+
+        # Vet help-related sends against the single-winner protocol.
+        teammates = self.WORLD_STATE.get('teammates', [])
+        peer_ids = (
+            [t['object_id'] for t in teammates
+             if t.get('object_id') and t['object_id'] != self.agent_id]
+            if message_type == MSG_ASK_HELP else []
+        )
+        expected = len(peer_ids) if peer_ids else (
+            count_eligible_responders(teammates, self.agent_id)
+            if message_type == MSG_ASK_HELP else 0
+        )
+        # Auto-infer victim id/location when the LLM omits them in an ask_help.
+        v_id = args.get('victim_id', '')
+        v_loc = args.get('victim_location')
+        if message_type == MSG_ASK_HELP and (not v_id or not v_loc):
+            inferred = self._infer_help_victim()
+            if inferred:
+                v_id = v_id or inferred[0]
+                v_loc = v_loc or inferred[1]
+        action, extra = self.help_coord.vet_outgoing(
+            message_type=message_type,
+            send_to=send_to,
+            text=text,
+            tick=self._tick_count,
+            victim_id=v_id,
+            victim_location=v_loc,
+            expected_responders=expected,
+            expected_peer_ids=peer_ids if message_type == MSG_ASK_HELP else None,
+        )
+        if action == 'suppress':
+            print(f'[{self.agent_id}] Help send suppressed: {extra}')
+            self.memory.update('help_blocked', {'reason': extra, 'tick': self._tick_count})
+            self._pipeline_stage = PipelineStage.IDLE
+            return self._idle()
+        if action == 'rewrite':
+            if 'text' in extra:
+                text = extra['text']
+
+        content_payload = {'message_type': message_type, 'text': text}
+        if isinstance(extra, dict):
+            for k, v in extra.items():
+                if k != 'text':
+                    content_payload[k] = v
+
         self.send_message(Message(
-            content={'message_type': message_type, 'text': text},
+            content=content_payload,
             from_id=self.agent_id,
             to_id=target,
         ))
@@ -1307,7 +993,7 @@ class SearchRescueAgent(LLMAgentBase):
                     print(f'[{self.agent_id}] Help reply coerced to "no" — cooperatively engaged')
                 quick_reply = stripped
                 self.communication.mark_help_answered(target)
-                self._record_help_reply(requester=target, reply=quick_reply)
+                self.help_tracker.record_reply(requester_id=target, reply=quick_reply)
                 if quick_reply == 'yes':
                     self._begin_help_autonav(requester=target)
 
@@ -1322,24 +1008,13 @@ class SearchRescueAgent(LLMAgentBase):
 
         # Requester bookkeeping: register expected responders for own ask_help
         if message_type == 'ask_help':
-            expected = self._count_eligible_responders()
-            self._register_help_request_sent(expected)
+            expected = count_eligible_responders(
+                self.WORLD_STATE.get('teammates', []), self.agent_id
+            )
+            self.help_tracker.register_sent(self._tick_count, expected)
 
         self._pipeline_stage = PipelineStage.IDLE
         return self._idle()
-
-    def _count_eligible_responders(self) -> int:
-        """Upper-bound count of teammates that could respond.
-
-        Teammate carrying-state isn't reliably visible from perception, so we
-        count every known teammate (excluding self, defensively). If some are
-        busy carrying and never reply, the 500-tick timeout path covers the
-        abandon case.
-        """
-        return sum(
-            1 for t in (self.WORLD_STATE.get('teammates', []) or [])
-            if t.get('object_id') != self.agent_id
-        )
 
     def execute(self) -> Tuple[Optional[str], Dict]:
         name = self._pipeline_context['action_name']
@@ -1380,6 +1055,10 @@ class SearchRescueAgent(LLMAgentBase):
         check = self._validate_action(name, args)
         if check is not None:
             self._recent_actions.append({'name': name, 'args': args, 'result': 'validation_failed'})
+            self._pipeline_context['critic_result'] = {
+                'success': False,
+                'critique': self._last_validation_error or f"Action {name} failed validation.",
+            }
             self._pipeline_stage = PipelineStage.REASONING
             return check
 

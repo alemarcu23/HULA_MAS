@@ -229,7 +229,12 @@ def get_game_rules(drop_zone=(23, 8), capabilities: Optional[Dict[str, Any]] = N
            "Navigation:",
            "- Use MoveTo(x, y) or MoveToArea(area) to navigate. You must be adjacent to an object to interact with it.",
            "- Use EnterArea(area) when you are at the door of an area to enter it.",
-           "- Use SearchArea(area) to systematically cover all cells in an area.",
+           "- Use SearchArea(area) to systematically visit every cell in an area and detect victims.",
+           "  SearchArea is REQUIRED for victim detection — MoveTo/MoveToArea alone will MISS victims.",
+           "  Do NOT consider an area searched until SearchArea has been called and coverage shows 100%.",
+           "  WARNING: SearchArea will fail or get stuck if an obstacle is blocking the path near the",
+           "  agent or near the area door. If SearchArea is not making progress, check observation.",
+           "  obstacles and use RemoveObject/RemoveObjectTogether to clear the blocker first.",
            "- NEVER call MoveTo with your own current position — that is a no-op.",
            ]
     )
