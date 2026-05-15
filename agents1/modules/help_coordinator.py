@@ -53,6 +53,8 @@ class _MyRequest:
     victim_location: Optional[Tuple[int, int]]
     tick_sent: int
     expected: int
+    kind: str = 'carry'           # 'carry' | 'remove'
+    target_id: str = ''           # victim_id for carry, obstacle_id for remove
     replies: Dict[str, str] = field(default_factory=dict)
     assigned_to: Optional[str] = None
     expected_peers: List[str] = field(default_factory=list)
@@ -66,6 +68,8 @@ class _KnownRequest:
     victim_id: str
     victim_location: Optional[Tuple[int, int]]
     tick_received: int
+    kind: str = 'carry'
+    target_id: str = ''
     assigned_to: Optional[str] = None
 
 
@@ -75,6 +79,9 @@ class _MyAcceptance:
     requester: str
     victim_id: str
     tick_accepted: int
+    kind: str = 'carry'
+    target_id: str = ''
+    target_location: Optional[Tuple[int, int]] = None
 
 
 @dataclass
@@ -114,7 +121,44 @@ class HelpCoordinator:
             'request_id': self._my_acceptance.request_id,
             'requester': self._my_acceptance.requester,
             'victim_id': self._my_acceptance.victim_id,
+            'kind': self._my_acceptance.kind,
+            'target_id': self._my_acceptance.target_id,
+            'target_location': self._my_acceptance.target_location,
         }
+
+    def is_responder_committed(self) -> bool:
+        return self._my_acceptance is not None
+
+    def clear_my_acceptance(self, reason: str = '') -> None:
+        if self._my_acceptance is not None:
+            print(f'[{self.agent_id}] Clearing _my_acceptance ({reason or "n/a"})')
+            self._my_acceptance = None
+
+    def broadcast_complete(self, tick: int) -> List[Message]:
+        """Helper-side: emit MSG_HELP_COMPLETE for the currently accepted request.
+
+        Used when this agent finished the coop action it accepted (carry or
+        remove). Clears _my_acceptance and the corresponding _known_active.
+        Returns the outbound messages to send.
+        """
+        outbound: List[Message] = []
+        a = self._my_acceptance
+        if a is None:
+            return outbound
+        duration = tick - a.tick_accepted
+        outbound.append(self._build_msg(MSG_HELP_COMPLETE, {
+            'request_id': a.request_id,
+            'victim_id': a.victim_id,
+            'requester': a.requester,
+            'responder': self.agent_id,
+            'duration_ticks': duration,
+            'text': f'help for {a.requester} ({a.kind} {a.target_id or a.victim_id}) complete',
+        }, to_id=None))
+        self._completed_ids.add(a.request_id)
+        if self._known_active and self._known_active.request_id == a.request_id:
+            self._known_active = None
+        self._my_acceptance = None
+        return outbound
 
     def is_request_already_assigned(self, requester_id: str) -> bool:
         k = self._known_active
@@ -146,6 +190,8 @@ class HelpCoordinator:
         victim_location: Optional[Tuple[int, int]] = None,
         expected_responders: int = 0,
         expected_peer_ids: Optional[List[str]] = None,
+        kind: str = 'carry',
+        target_id: str = '',
     ) -> Tuple[str, Any]:
         """Validate / rewrite a help-related outbound message.
 
@@ -159,12 +205,14 @@ class HelpCoordinator:
             return self._vet_ask_help(
                 text, tick, victim_id, victim_location,
                 expected_responders, expected_peer_ids,
+                kind=kind, target_id=target_id,
             )
         if message_type == MSG_HELP and send_to and send_to != 'all':
             return self._vet_help_reply(send_to, text, tick)
         return _ACTION_SEND, {}
 
-    def _vet_ask_help(self, text, tick, victim_id, victim_location, expected_responders, expected_peer_ids=None):
+    def _vet_ask_help(self, text, tick, victim_id, victim_location, expected_responders,
+                      expected_peer_ids=None, kind='carry', target_id=''):
         if self._my_request is not None:
             return _ACTION_SUPPRESS, 'already have an active ask_help'
         if self._known_active is not None and self._known_active.requester != self.agent_id:
@@ -174,6 +222,8 @@ class HelpCoordinator:
         if not victim_location:
             victim_location = extract_coords_from_text(text or '')
         peers = list(expected_peer_ids or [])
+        # target_id defaults to victim_id when kind=='carry' (legacy behavior)
+        resolved_target = target_id or victim_id or ''
         self._my_request = _MyRequest(
             request_id=rid,
             victim_id=victim_id or '',
@@ -181,11 +231,15 @@ class HelpCoordinator:
             tick_sent=tick,
             expected=max(int(expected_responders or 0), len(peers)),
             expected_peers=peers,
+            kind=kind or 'carry',
+            target_id=resolved_target,
         )
         return _ACTION_REWRITE, {
             'request_id': rid,
             'victim_id': victim_id or '',
             'victim_location': list(victim_location) if victim_location else None,
+            'kind': kind or 'carry',
+            'target_id': resolved_target,
         }
 
     def _vet_help_reply(self, target, text, tick):
@@ -205,6 +259,9 @@ class HelpCoordinator:
                 requester=k.requester,
                 victim_id=k.victim_id,
                 tick_accepted=tick,
+                kind=k.kind,
+                target_id=k.target_id or k.victim_id,
+                target_location=k.victim_location,
             )
             return _ACTION_REWRITE, {'text': 'yes', 'request_id': k.request_id}
 
@@ -305,6 +362,8 @@ class HelpCoordinator:
             victim_id=content.get('victim_id', ''),
             victim_location=loc if isinstance(loc, tuple) else None,
             tick_received=tick,
+            kind=content.get('kind', 'carry') or 'carry',
+            target_id=content.get('target_id') or content.get('victim_id', '') or '',
         )
 
     def _on_help_reply(self, content, sender, tick, outbound):

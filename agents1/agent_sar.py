@@ -148,6 +148,13 @@ class SearchRescueAgent(LLMAgentBase):
         self._current_action: Optional[Dict[str, Any]] = None  # set by REASONING handler this cycle
         self._last_plan: Optional[str] = None           # _current_plan from previous cycle
         self._last_action: Optional[Dict[str, Any]] = None     # _current_action from previous cycle
+        # Optional second action committed by reasoning alongside a MoveTo primary.
+        # Promoted to _current_action on the tick after _nav_target clears, without
+        # invoking the planner. Cleared on validation rejection, critic failure,
+        # urgent banners, or one successful promotion.
+        self._queued_action: Optional[Dict[str, Any]] = None
+        # Outcome of the most recent executed action, fed back to reasoning.
+        self._last_action_outcome: str = ''
 
         # Cumulative belief over the run, keyed by object_id. Rebuilt each tick
         # from WORLD_STATE_GLOBAL minus rescued victims / removed obstacles.
@@ -380,19 +387,98 @@ class SearchRescueAgent(LLMAgentBase):
             for m in new_msgs
         ])
 
+    def _try_promote_queued_action(self) -> bool:
+        """Promote `_queued_action` to `_current_action` and jump to EXECUTE.
+
+        Preconditions:
+        - A queued action exists.
+        - Navigation has finished (_nav_target is None).
+        - The primary MoveTo did not produce a validation error.
+        - No urgent help banner is active (those override everything).
+        - The last critic did not flag failure (premise of the pair is broken).
+
+        Returns True iff promotion happened.
+        """
+        if self._queued_action is None:
+            return False
+
+        if self._nav_target is not None:
+            return False  # still navigating; wait
+
+        # Validator rejected the primary — the queued action's precondition
+        # (being at the destination) cannot be assumed.
+        if self._last_validation_error:
+            print(f'[{self.agent_id}] Dropping queued action: primary MoveTo had validation error')
+            self._queued_action = None
+            return False
+
+        # Urgent help requests take precedence over any queued plan.
+        if self.communication.get_open_help_request():
+            print(f'[{self.agent_id}] Dropping queued action: urgent help request pending')
+            self._queued_action = None
+            return False
+
+        # If recent_actions show the same action 3x, we are looping — bail to planner.
+        if (len(self._recent_actions) == 3
+                and len({json.dumps(a, sort_keys=True) for a in self._recent_actions}) == 1):
+            print(f'[{self.agent_id}] Dropping queued action: loop detected on primary')
+            self._queued_action = None
+            return False
+
+        queued = self._queued_action
+        self._queued_action = None
+        name, args = queued['name'], queued['args']
+
+        # Reuse the previous cycle's plan text for continuity in memory/logs.
+        self._current_plan = self._last_plan or ''
+        self._current_action = {'name': name, 'args': args}
+        self._pipeline_context['action_name'] = name
+        self._pipeline_context['action_args'] = args
+        self._pipeline_context['planned_task'] = self._current_plan
+        self._pipeline_context['queued_after'] = 'MoveTo'
+
+        self.episode_memory.set_planned_task(self._current_plan)
+        self.episode_memory.set_motivation('[queued follow-up after MoveTo]')
+
+        print(f'[{self.agent_id}] Promoted queued action: {name}({args})')
+
+        self._pipeline_stage = (
+            PipelineStage.COMM_DISPATCH if name == 'SendMessage'
+            else PipelineStage.EXECUTE
+        )
+        return True
+
     def _advance_pipeline(self) -> Tuple[Optional[str], Dict]:
         # Requester suspension: hold the pipeline while our ask_help is pending.
         # Rendezvous / autopilot still run because they live in _run_infra,
         # which executes before this method.
         if self.help_coord.is_requester_waiting():
             return self._idle(reason='awaiting_help_response')
+        # Responder suspension: while we have an accepted help commitment AND
+        # the coop machinery (autonav / coop-carry / coop-remove rendezvous) is
+        # driving us, do NOT replan. Otherwise we spam plan_update messages and
+        # never actually help. Suspension lifts when _my_acceptance clears OR
+        # the coop slot empties (target gone, etc.).
+        if (self.help_coord.is_responder_committed()
+                and (self._nav_target is not None
+                     or self._coop_carry_role is not None
+                     or self._coop_remove_role is not None
+                     or self._carry_autopilot is not None)):
+            return self._idle(reason='executing_accepted_help')
 
         if self._pipeline_stage == PipelineStage.IDLE:
             self._get_or_assign_role()  # assign roles and high-level goal on first cycle only
             self._is_first_cycle = False
             self._pipeline_context = {}
             self._open_episode_cycle()
-            self._pipeline_stage = PipelineStage.PLANNING
+            # Queued-action promotion: if reasoning previously committed a
+            # MoveTo + follow-up pair and the navigation just completed cleanly,
+            # execute the follow-up this cycle without invoking the planner.
+            if self._try_promote_queued_action():
+                # Stage was set inside the helper (EXECUTE or COMM_DISPATCH).
+                pass
+            else:
+                self._pipeline_stage = PipelineStage.PLANNING
         if self._pipeline_stage == PipelineStage.PLANNING:
             return self.plan()
         if self._pipeline_stage == PipelineStage.REASONING:
@@ -568,6 +654,7 @@ class SearchRescueAgent(LLMAgentBase):
             'urgent_help_request': open_help,
             'urgent_abandon': urgent_abandon,
             'active_help_request': self.help_coord.active_request_snapshot(),
+            'my_help_acceptance': self.help_coord.my_acceptance(),
             'last_validation_error': last_validation_error,
             'area_summaries': [
                 {**s, 'door': self.env_info.get_door(int(s['name'].split()[-1]))}
@@ -682,9 +769,18 @@ class SearchRescueAgent(LLMAgentBase):
             'last_critique': last_critique,
             'observation': observation,
             'recent_actions': recent_actions_list,
+            'last_action': (
+                {
+                    'name': self._last_action.get('name'),
+                    'args': self._last_action.get('args', {}),
+                    'outcome': self._last_action_outcome,
+                }
+                if self._last_action else None
+            ),
             'tools_available': list(self.tools_by_name.keys()),
             'urgent_help_request': open_help,
             'active_help_request': self.help_coord.active_request_snapshot(),
+            'my_help_acceptance': self.help_coord.my_acceptance(),
             # Carry the latest validation error so the reasoner understands exactly
             # why the last action was rejected (e.g. obstacle blocking the door).
             'last_validation_error': self._last_validation_error or '',
@@ -808,6 +904,23 @@ class SearchRescueAgent(LLMAgentBase):
         args_raw = tc.function.arguments
         args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
         print(f'[{self.agent_id}] Tool call: {name}({args})')
+
+        # Optional second tool call: only valid as MoveTo + colocated follow-up.
+        self._queued_action = None
+        if len(tool_calls) >= 2:
+            tc2 = tool_calls[1]
+            name2 = tc2.function.name
+            args2_raw = tc2.function.arguments
+            args2 = json.loads(args2_raw) if isinstance(args2_raw, str) else (args2_raw or {})
+            allowed_followups = {'PickUp', 'SearchArea', 'RemoveObject', 'CarryObject', 'Drop'}
+            if name == 'MoveTo' and name2 in allowed_followups:
+                self._queued_action = {'name': name2, 'args': args2}
+                print(f'[{self.agent_id}] Queued follow-up action: {name2}({args2})')
+            else:
+                print(
+                    f'[{self.agent_id}] Rejected 2-call pairing ({name} + {name2}); '
+                    f'executing only the first.'
+                )
 
         self._pipeline_context['action_name'] = name
         self._pipeline_context['action_args'] = args
@@ -936,6 +1049,15 @@ class SearchRescueAgent(LLMAgentBase):
             if inferred:
                 v_id = v_id or inferred[0]
                 v_loc = v_loc or inferred[1]
+        # Determine help kind: 'carry' for victim coop-carry, 'remove' for obstacle coop-remove.
+        # Honor an explicit LLM-provided `kind`; otherwise infer from target id.
+        ask_kind = (args.get('kind') or '').strip().lower() if message_type == MSG_ASK_HELP else ''
+        ask_target_id = args.get('target_id', '') if message_type == MSG_ASK_HELP else ''
+        if message_type == MSG_ASK_HELP and not ask_kind:
+            tid_lower = (ask_target_id or v_id or '').lower()
+            ask_kind = 'remove' if ('obstacle' in tid_lower or 'rock' in tid_lower or 'tree' in tid_lower) else 'carry'
+        if message_type == MSG_ASK_HELP and not ask_target_id:
+            ask_target_id = v_id or ''
         action, extra = self.help_coord.vet_outgoing(
             message_type=message_type,
             send_to=send_to,
@@ -945,6 +1067,8 @@ class SearchRescueAgent(LLMAgentBase):
             victim_location=v_loc,
             expected_responders=expected,
             expected_peer_ids=peer_ids if message_type == MSG_ASK_HELP else None,
+            kind=ask_kind or 'carry',
+            target_id=ask_target_id,
         )
         if action == 'suppress':
             print(f'[{self.agent_id}] Help send suppressed: {extra}')
@@ -1055,6 +1179,11 @@ class SearchRescueAgent(LLMAgentBase):
         check = self._validate_action(name, args)
         if check is not None:
             self._recent_actions.append({'name': name, 'args': args, 'result': 'validation_failed'})
+            self._last_action_outcome = 'rejected_by_validator'
+            # The queued follow-up depends on this primary succeeding; drop it.
+            if self._queued_action is not None:
+                print(f'[{self.agent_id}] Dropping queued action: primary {name} rejected by validator')
+                self._queued_action = None
             self._pipeline_context['critic_result'] = {
                 'success': False,
                 'critique': self._last_validation_error or f"Action {name} failed validation.",
@@ -1099,6 +1228,8 @@ class SearchRescueAgent(LLMAgentBase):
         self.memory.update('action', {'action': action_name, 'args': kwargs})
         self.episode_memory.set_action(action_name, kwargs, self._tick_count)
         self._recent_actions.append({'name': action_name, 'args': kwargs})
+        # Track outcome for reasoning's LAST ACTION block on the next cycle.
+        self._last_action_outcome = 'dispatched'
 
         if self.metrics:
             loc = self.WORLD_STATE.get('agent', {}).get('location', (0, 0))

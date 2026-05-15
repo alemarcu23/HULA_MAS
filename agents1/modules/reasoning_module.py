@@ -6,16 +6,32 @@ from helpers.toon_utils import to_toon
 
 REASONING_PROMPT_CORE = """
 You are a Search and Rescue agent. Your job each cycle is to execute the
-`current_plan` (already decided by the planner) by emitting EXACTLY ONE tool
-call.
+`current_plan` (already decided by the planner) by emitting ONE tool call —
+or TWO tool calls in the single allowed pairing described below.
 
 The plan is atomic and fully specified (it includes any required victim_id,
 [x, y], obstacle_id, partner_id). You do NOT re-plan. If the plan looks
 unreachable, choose the tool call that makes the most direct progress toward
 it (e.g. MoveTo before Carry, RemoveObject if an obstacle is in the way).
 
+Two-call pairing (the ONLY allowed multi-call shape):
+- You MAY emit exactly TWO tool calls when the first is `MoveTo(x, y)` and the
+  second is the colocated follow-up that the plan implies at that destination:
+  `PickUp`, `SearchArea`, `RemoveObject`, `CarryObject`, or `Drop`.
+- The second call must use the same target (matching coordinates / object_id)
+  that the plan specifies. Navigation will complete first across multiple
+  ticks; the second action will fire automatically on arrival without a fresh
+  planner cycle.
+- Never emit two MoveTos, never emit a SendMessage as the second call, never
+  emit a follow-up before a non-MoveTo primary. In any other case emit ONE
+  tool call.
+- If the current_plan is itself a non-move atomic action (e.g. "Pick up
+  victim_X at [x, y]" while you are already at [x, y]), emit ONE call — do
+  not pad with a redundant MoveTo.
+
 Rules:
-- Return exactly one tool call — no natural language, no explanations.
+- Return one tool call (or the allowed two-call pair) — no natural language,
+  no explanations.
 - Every tool call has a `task_completing` field. Set it to the exact
   `current_plan` text if this single action completes the plan; otherwise "N/A".
 - Verify from OBSERVATION that the plan is actually completed before setting
@@ -136,6 +152,21 @@ def _format_reasoning_user_content(information: Dict[str, Any]) -> str:
             "",
         ])
 
+    my_acc = information.get('my_help_acceptance')
+    if my_acc:
+        lines.extend([
+            "== YOU HAVE AN ACCEPTED HELP COMMITMENT ==",
+            f"You said 'yes' to {my_acc.get('requester')}'s ask_help for "
+            f"{my_acc.get('kind')} of {my_acc.get('target_id') or my_acc.get('victim_id')}.",
+            "Your job is to fulfill this commitment — do NOT abandon it to "
+            "explore or pursue a different task. If you are not already walking "
+            "to the target or in a coop rendezvous, plan a MoveTo the target "
+            "location and then CarryObjectTogether (if kind=carry) or "
+            "RemoveObjectTogether (if kind=remove) with the requester.",
+            "==========================================",
+            "",
+        ])
+
     active_req = information.get('active_help_request')
     if active_req:
         lines.extend([
@@ -163,6 +194,20 @@ def _format_reasoning_user_content(information: Dict[str, Any]) -> str:
         f"Carrying: {carrying}",
         "",
     ])
+
+    # ── LAST ACTION (most recent executed action, distinct from loop tail) ──
+    last_action = information.get('last_action')
+    if last_action:
+        la_name = last_action.get('name', '?')
+        la_args = last_action.get('args', {})
+        la_outcome = last_action.get('outcome', '')
+        lines.extend([
+            "== LAST ACTION ==",
+            f"Name: {la_name}",
+            f"Args: {to_toon(la_args) if la_args else '{}'}",
+            f"Outcome: {la_outcome}" if la_outcome else "Outcome: (not recorded)",
+            "",
+        ])
 
     # ── VALIDATION ERROR (from previous action, if any) ──────────────────────
     last_validation_error = information.get('last_validation_error', '')

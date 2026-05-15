@@ -808,32 +808,43 @@ class CarryObjectTogether(Action):
         grab_range = 1 if 'grab_range' not in kwargs else kwargs['grab_range']
         max_objects = np.inf if 'max_objects' not in kwargs else kwargs['max_objects']
 
-        # Check calling agent is adjacent to the object.
-        # world_state[object_id] is None when the object is already in another
-        # agent's inventory (removed from the world grid) — treat as not-in-range
-        # so the action fails gracefully instead of crashing.
+        partner_name = kwargs.get('partner_name', '') or ''
+
+        # Both agents must stand on the victim's exact tile for a cooperative
+        # carry. world_state[object_id] is None when the object is already in
+        # another agent's inventory — treat as not-in-range so the action fails
+        # gracefully instead of crashing.
+        obj_loc = None
         if object_id:
             obj_state = world_state[object_id]
             if obj_state is None:
                 print("GrabObjectResult.NOT_IN_RANGE — object not in world (already carried).")
                 return GrabObjectResult(GrabObjectResult.NOT_IN_RANGE, False)
-            agent_loc = world_state[agent_id]['location']
-            if get_distance(agent_loc, obj_state['location']) > grab_range:
-                print("GrabObjectResult.NOT_IN_RANGE — agent not adjacent to object.")
+            obj_loc = tuple(obj_state['location'])
+            agent_loc = tuple(world_state[agent_id]['location'])
+            if agent_loc != obj_loc:
+                print("GrabObjectResult.NOT_IN_RANGE — agent not on victim tile.")
                 return GrabObjectResult(GrabObjectResult.NOT_IN_RANGE, False)
 
-        # Find nearest partner agent (AI or human) for cooperative carry
-        partner = _find_partner_agent(world_state, agent_id)
+        # Look up the rendezvous partner by name; fall back to nearest only if
+        # no partner_name was passed (preserves compatibility with other callers).
+        partner = None
+        if partner_name:
+            cand = world_state.get(partner_name)
+            if isinstance(cand, dict):
+                partner = cand
+        if partner is None:
+            partner = _find_partner_agent(world_state, agent_id)
 
         if partner is None:
             print("GrabObjectResult.NOT_IN_RANGE — no partner found.")
             return GrabObjectResult(GrabObjectResult.NOT_IN_RANGE, False)
-        if object_id and get_distance(partner['location'], world_state[object_id]['location']) > grab_range:
-            print("GrabObjectResult.NOT_IN_RANGE — partner not adjacent to object.")
+        if object_id and tuple(partner['location']) != obj_loc:
+            print("GrabObjectResult.NOT_IN_RANGE — partner not on victim tile.")
             return GrabObjectResult(GrabObjectResult.NOT_IN_RANGE, False)
-        else:
-            print("GrabObjectResult.ACTION_SUCCEEDED.")
-            return _is_possible_grab(grid_world, agent_id=agent_id, object_id=object_id, grab_range=grab_range,
+
+        print("GrabObjectResult.ACTION_SUCCEEDED.")
+        return _is_possible_grab(grid_world, agent_id=agent_id, object_id=object_id, grab_range=grab_range,
                                  max_objects=max_objects)
 
     def mutate(self, grid_world, agent_id, world_state, **kwargs):

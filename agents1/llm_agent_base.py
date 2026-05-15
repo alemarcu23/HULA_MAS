@@ -492,7 +492,80 @@ class LLMAgentBase(ArtificialBrain, Perception):
         if nav is not None:
             return nav
 
+        # Help-accept arrival hook: if we just finished walking to a help target
+        # AND we have an outstanding _my_acceptance, auto-initiate the coop
+        # action (carry victim / remove obstacle) the seeker is waiting for.
+        arrival = self._handle_help_arrival()
+        if arrival is not None:
+            return arrival
+
         return None
+
+    def _handle_help_arrival(self) -> Optional[Tuple[str, Dict]]:
+        """Bridge from help-autonav arrival into the coop action.
+
+        Called when no other infra path produced an action. If we are still
+        committed (``help_coord.is_responder_committed()``) but nav has cleared
+        AND no coop rendezvous is yet active, set up the right one based on
+        ``acceptance['kind']``. The coop tick handlers will drive it to
+        completion on subsequent ticks.
+        """
+        help_coord = getattr(self, 'help_coord', None)
+        if help_coord is None or not help_coord.is_responder_committed():
+            return None
+        if (self._nav_target is not None
+                or self._coop_carry_role is not None
+                or self._coop_remove_role is not None
+                or self._carry_autopilot is not None):
+            return None
+        acceptance = help_coord.my_acceptance()
+        if not acceptance:
+            return None
+        kind = (acceptance.get('kind') or 'carry').lower()
+        target_id = acceptance.get('target_id') or acceptance.get('victim_id') or ''
+        partner = acceptance.get('requester') or ''
+        if not target_id or not partner:
+            print(f'[{self.agent_id}] Help arrival: missing target/partner — clearing acceptance')
+            help_coord.clear_my_acceptance('missing_target_or_partner')
+            return None
+
+        ok = False
+        if kind == 'remove':
+            ok = self._setup_coop_remove_rendezvous(obj_id=target_id, partner_id=partner)
+        else:  # default: carry
+            ok = self._setup_coop_carry_rendezvous(victim_id=target_id, partner_id=partner)
+
+        if not ok:
+            print(f'[{self.agent_id}] Help arrival: coop setup failed ({kind}, target={target_id}) — clearing acceptance')
+            help_coord.clear_my_acceptance('coop_setup_failed')
+            return None
+
+        print(f'[{self.agent_id}] Help arrival: initiated coop {kind} for {target_id} with {partner}')
+        # Let the next tick's _handle_coop_* drive the action.
+        return None
+
+    def _broadcast_help_complete_if_match(self, completed_target_id: str) -> None:
+        """Emit MSG_HELP_COMPLETE if the just-completed coop fulfilled our acceptance.
+
+        Compares the just-completed target (victim_id from carry, obj_id from
+        remove) against ``_my_acceptance.target_id``. On a match, calls
+        ``help_coord.broadcast_complete(tick)`` and sends the resulting
+        messages so the seeker can clear its _my_request and resume planning.
+        """
+        help_coord = getattr(self, 'help_coord', None)
+        if help_coord is None:
+            return
+        acceptance = help_coord.my_acceptance()
+        if not acceptance:
+            return
+        target = (acceptance.get('target_id') or acceptance.get('victim_id') or '')
+        if not completed_target_id or completed_target_id != target:
+            return
+        tick = getattr(self, '_tick_count', 0)
+        outbound = help_coord.broadcast_complete(tick)
+        for msg in outbound:
+            self.send_message(msg)
+        print(f'[{self.agent_id}] Sent help_complete for {target} → seeker can resume')
 
     def _check_carry_success(self) -> None:
         """Detect successful CarryObjectTogether and enter autopilot to drop zone.
@@ -543,6 +616,10 @@ class LLMAgentBase(ArtificialBrain, Perception):
             if self.shared_memory:
                 self.shared_memory.update(SM_RENDEZVOUS, None)
             self._coop_carry_role = self._coop_carry_victim_id = self._coop_carry_partner_id = None
+
+        # If this carry fulfilled an outstanding help acceptance, notify the
+        # seeker so it can stop waiting and resume normal planning.
+        self._broadcast_help_complete_if_match(obj_id)
 
     def _handle_carry_autopilot(self) -> Optional[Tuple[str, Dict]]:
         """Handle autopilot navigation to drop zone after a cooperative carry.
@@ -688,7 +765,10 @@ class LLMAgentBase(ArtificialBrain, Perception):
                 'victim_id': victim_id,
                 'victim_location': victim_loc,
                 'partner': partner_id,
-                'initiator_ready': False,
+                'initiator_location': list(self.agent_location),
+                'partner_location': None,
+                'initiator_on_victim': False,
+                'partner_on_victim': False,
                 'tick_started': self._tick_count,
             },
             dedupe_key='victim_id',
@@ -757,46 +837,70 @@ class LLMAgentBase(ArtificialBrain, Perception):
             print(f'[{self.agent_id}] Partner rendezvous timeout for victim {victim_id_log}')
             return self._idle('partner_rendezvous_timeout')
 
-        # Navigate to victim using existing A* infrastructure
-        victim_loc = tuple(rv['victim_location'])
-        dist = _chebyshev_distance(self.agent_location, victim_loc)
-        if dist > 1:
-            if self._nav_target != victim_loc:
-                nav_target, action = navigate_to(victim_loc,
+        # Refresh own location in SharedMemory so the other agent's nav can
+        # fall back to it if victim_location is missing.
+        my_loc = tuple(self.agent_location)
+        loc_key = 'initiator_location' if self._coop_carry_role == 'initiator' else 'partner_location'
+        if tuple(rv.get(loc_key) or (None,)) != my_loc:
+            updated = dict(rv)
+            updated[loc_key] = list(my_loc)
+            self.shared_memory.update(SM_RENDEZVOUS, updated)
+            rv = updated
+
+        victim_loc_raw = rv.get('victim_location')
+        victim_loc = tuple(victim_loc_raw) if victim_loc_raw is not None else None
+
+        # Resolve nav target: victim tile if known, else teammate's tile (partner only).
+        if victim_loc is not None:
+            target_tile = victim_loc
+        elif self._coop_carry_role == 'partner':
+            init_loc_raw = rv.get('initiator_location')
+            target_tile = tuple(init_loc_raw) if init_loc_raw is not None else None
+        else:
+            target_tile = None
+
+        if target_tile is None:
+            return self._idle('coop_carry_no_target')
+
+        # Step onto the target tile (exact same cell — not just adjacent).
+        if my_loc != target_tile:
+            if self._nav_target != target_tile:
+                nav_target, action = navigate_to(target_tile,
                                                  navigator=self._navigator,
                                                  state_tracker=self._state_tracker)
                 self._nav_target = nav_target
                 return action
             return None  # navigation in progress — _handle_navigation_tick handles moves
 
-        # Adjacent to victim
-        if self._coop_carry_role == 'initiator' and not rv.get('initiator_ready'):
+        # On the target tile. Set on_victim flag only when target IS the victim tile.
+        on_victim = (victim_loc is not None and my_loc == victim_loc)
+        flag_key = 'initiator_on_victim' if self._coop_carry_role == 'initiator' else 'partner_on_victim'
+        if on_victim and not rv.get(flag_key):
             updated = dict(rv)
-            updated['initiator_ready'] = True
+            updated[flag_key] = True
             self.shared_memory.update(SM_RENDEZVOUS, updated)
-            print(f'[{self.agent_id}] Initiator adjacent, marked ready — waiting for partner')
-
-        # Partner waits until initiator is also adjacent
-        if self._coop_carry_role == 'partner' and not rv.get('initiator_ready'):
-            return self._idle('waiting_for_initiator')
+            rv = updated
+            role_label = 'Initiator' if self._coop_carry_role == 'initiator' else 'Partner'
+            print(f'[{self.agent_id}] {role_label} on victim tile — waiting for teammate')
 
         # Safety guard: if victim is no longer in the world (already picked up by
         # the other agent on this same tick), don't fire — MATRX would crash trying
         # to index world_state[object_id] which returns None for inventory objects.
-        # Also clear SharedMemory so the partner doesn't keep re-enrolling on a stale entry.
         if (self.state_for_navigation is not None
                 and self.state_for_navigation.get(self._coop_carry_victim_id) is None):
-            # Victim gone from world — partner grabbed it or it was rescued; clear rendezvous.
             if self.shared_memory:
                 self.shared_memory.update(SM_RENDEZVOUS, None)
             self._coop_carry_role = self._coop_carry_victim_id = self._coop_carry_partner_id = None
             return None
 
-        # Both adjacent + initiator ready → fire CarryObjectTogether (pure code, no LLM)
-        return _CarryObjectTogether.__name__, {
-            'object_id': self._coop_carry_victim_id,
-            'partner_name': self._coop_carry_partner_id,
-        }
+        # Both agents on victim tile → fire CarryObjectTogether (pure code, no LLM).
+        if rv.get('initiator_on_victim') and rv.get('partner_on_victim'):
+            return _CarryObjectTogether.__name__, {
+                'object_id': self._coop_carry_victim_id,
+                'partner_name': self._coop_carry_partner_id,
+            }
+
+        return self._idle('coop_carry_waiting_for_teammate')
 
     # ── Cooperative remove rendezvous state machine ───────────────────────────
 
@@ -810,7 +914,10 @@ class LLMAgentBase(ArtificialBrain, Perception):
             print(f'[{self.agent_id}] RemoveObjectTogether succeeded — clearing rendezvous')
             if self.shared_memory:
                 self.shared_memory.update(SM_REMOVE_RENDEZVOUS, None)
+            completed_obj = self._coop_remove_obj_id
             self._coop_remove_role = self._coop_remove_obj_id = self._coop_remove_partner_id = None
+            # Notify seeker if this fulfilled an outstanding help acceptance.
+            self._broadcast_help_complete_if_match(completed_obj or '')
 
     def _setup_coop_remove_rendezvous(self, obj_id: str, partner_id: str) -> bool:
         """Write a remove rendezvous entry to SharedMemory and enter initiator mode.
